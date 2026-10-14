@@ -14,6 +14,7 @@ import platform
 import queue
 import random
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -153,13 +154,129 @@ def hidden_process_kwargs():
 
 
 def resolve_cli(path):
-    """Returns a usable path to windscribe-cli, or None."""
+    """Returns the argv that runs windscribe-cli, or None.
+
+    A single executable path still works. A command such as
+    ``wsl -d Ubuntu -u ubroot -- windscribe-cli`` is accepted when its first token is on PATH.
+    """
     path = (path or "").strip().strip('"')
     if not path:
         return None
-    if os.path.isfile(path):
-        return path
-    return shutil.which(path)
+    parts = [path] if os.path.isfile(path) else shlex.split(path, posix=not IS_WINDOWS)
+    # The last word must be the CLI itself, so a bare "wsl" or "wsl -d Ubuntu --" is not "ready".
+    if not parts or os.path.basename(parts[-1]).lower() not in ("windscribe-cli", "windscribe-cli.exe"):
+        return None
+    if os.path.isfile(parts[0]) or shutil.which(parts[0]):
+        return parts
+    return None
+
+
+def cli_probe(argv):
+    """True when the command really is windscribe-cli: its help banner names itself, with no service needed."""
+    try:
+        out = subprocess.run(list(argv) + ["help"], capture_output=True, text=True, errors="replace",
+                             timeout=30, **hidden_process_kwargs()).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return "windscribe-cli" in out.lower()
+
+
+def wsl_prefix(argv):
+    """The ``wsl … --`` prefix in front of windscribe-cli, or None for a native binary."""
+    if not argv:
+        return None
+    base = os.path.basename(argv[0]).lower()
+    if base not in ("wsl", "wsl.exe") or "--" not in argv:
+        return None
+    return argv[:argv.index("--") + 1]
+
+
+def linux_cli(argv):
+    """Only the Linux CLI build has the editable conf file; the Windows exe is a thin client of the GUI."""
+    return bool(wsl_prefix(argv)) or platform.system() == "Linux"
+
+
+# Empty string always means "Windscribe default", so a Windows row equals a Linux default row.
+TLS_VALUES = {"off": [""], "on": ["on"], "both": ["", "on"]}
+ROUTING_VALUES = {"auto": [""], "regular": ["regular"], "alternate": ["alternate"],
+                  "both": ["regular", "alternate"]}
+
+
+def route_label(r):
+    """``wireguard:443 · A · TLS · alt``; default rows read ``wireguard:443`` like upstream."""
+    parts = [f"{r['proto']}:{r['port']}"]
+    awg = r.get("awg") or ""
+    if awg:
+        parts.append(awg.split(" - ", 1)[0].strip() or awg)
+    if r.get("tls"):
+        parts.append("TLS")
+    if r.get("routing"):
+        parts.append(r["routing"][:3])
+    return " · ".join(parts)
+
+
+def expand_routes(work_plan, presets, tls_mode="off", routing_mode="auto"):
+    """(proto, port, awg, tls, routing) routes. Presets multiply WireGuard only; TLS and routing multiply all."""
+    routes = []
+    for proto, ports in work_plan.items():
+        awgs = presets if proto == "wireguard" and presets else [""]
+        for port in ports:
+            for awg in awgs:
+                for tls in TLS_VALUES[tls_mode]:
+                    for routing in ROUTING_VALUES[routing_mode]:
+                        routes.append((proto, port, awg, tls, routing))
+    return routes
+
+
+def patch_conf(text, awg, tls, routing):
+    """Set the anti-censorship keys under [Connection] of windscribe_cli.conf (QSettings INI)."""
+    mapping = {
+        "ProtocolTweaksMethod": "1" if awg else "2",
+        "AmneziawgPreset": awg or "",
+        "CircumventCensorship": "true" if tls else "false",
+        "ServerRoutingMethod": {"regular": "1", "alternate": "2"}.get(routing, "0"),
+    }
+    lines = text.splitlines()
+    section = re.compile(r"^\[(.+)\]\s*$")
+    out = []
+    in_section = False
+    seen = set()
+
+    def flush():
+        for key, value in mapping.items():
+            if key not in seen:
+                out.append(f"{key}={value}")
+                seen.add(key)
+
+    for line in lines:
+        match = section.match(line.strip())
+        if match:
+            if in_section:
+                flush()
+            in_section = match.group(1) == "Connection"
+            out.append(line)
+            continue
+        if in_section and "=" in line:
+            key = line.split("=", 1)[0].strip()
+            if key in mapping:
+                out.append(f"{key}={mapping[key]}")
+                seen.add(key)
+                continue
+        out.append(line)
+    if in_section:
+        flush()
+    elif set(mapping) - seen:
+        if out and out[-1] != "":
+            out.append("")
+        out.append("[Connection]")
+        flush()
+    body = "\n".join(out)
+    return body if body.endswith("\n") else body + "\n"
+
+
+CLI_CONF = "~/.config/Windscribe/windscribe_cli.conf"
+_READ_CONF = ["sh", "-c", f"cat {CLI_CONF} 2>/dev/null"]
+_WRITE_CONF = ["sh", "-c", f"mkdir -p {os.path.dirname(CLI_CONF)} && cat > {CLI_CONF}"]
 
 
 def open_path(path):
@@ -347,9 +464,15 @@ class PingRunner:
                 times.append(float(m.group(1).replace(",", ".")))
         return times
 
-    def run(self, host, count=5, reply_timeout_ms=2000):
-        """Returns ({"avg", "min", "max", "loss"}, None) or (None, error)."""
-        if IS_WINDOWS:
+    def run(self, host, count=5, reply_timeout_ms=2000, wsl=None):
+        """Returns ({"avg", "min", "max", "loss"}, None) or (None, error).
+
+        ``wsl`` is the ``wsl … --`` prefix. Ping must run in that distro: a Windows ping
+        does not enter the WSL tunnel.
+        """
+        if wsl:
+            cmd = list(wsl) + ["ping", "-c", str(count), "-W", str(max(1, reply_timeout_ms // 1000)), host]
+        elif IS_WINDOWS:
             cmd = ["ping", "-n", str(count), "-w", str(reply_timeout_ms), host]
         else:
             cmd = ["ping", "-c", str(count), "-W", str(max(1, reply_timeout_ms // 1000)), host]
@@ -379,8 +502,9 @@ class PingRunner:
 # Database
 # ---------------------------------------------------------------------------
 class DatabaseManager:
-    EXPORT_COLUMNS = ["city", "location", "country", "protocol", "port", "status",
+    EXPORT_COLUMNS = ["city", "location", "country", "protocol", "port", "awg", "tls", "routing", "status",
                       "duration", "ping", "packet_loss", "profile_name", "timestamp"]
+    TWEAK_COLUMNS = ("awg", "tls", "routing")
 
     def __init__(self, app=None):
         self.app = app
@@ -389,42 +513,68 @@ class DatabaseManager:
         self.cursor = self.conn.cursor()
         self.create_table()
 
+    def _tests_ddl(self):
+        return '''
+            CREATE TABLE tests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                location TEXT,
+                city TEXT,
+                country TEXT,
+                protocol TEXT,
+                port INTEGER,
+                awg TEXT NOT NULL DEFAULT '',
+                tls TEXT NOT NULL DEFAULT '',
+                routing TEXT NOT NULL DEFAULT '',
+                status TEXT,
+                duration REAL,
+                ping REAL,
+                packet_loss REAL,
+                profile_name TEXT,
+                timestamp TEXT,
+                UNIQUE(location, city, country, protocol, port, awg, tls, routing)
+            )
+        '''
+
     def create_table(self):
         with self.lock:
-            self.cursor.execute('''
-                CREATE TABLE IF NOT EXISTS tests (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    location TEXT,
-                    city TEXT,
-                    country TEXT,
-                    protocol TEXT,
-                    port INTEGER,
-                    status TEXT,
-                    duration REAL,
-                    ping REAL,
-                    packet_loss REAL,
-                    profile_name TEXT,
-                    timestamp TEXT,
-                    UNIQUE(location, city, country, protocol, port)
-                )
-            ''')
-            self.conn.commit()
-            # Older databases from the speedtest version: add the new column if missing.
+            exists = self.cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='tests'").fetchone()
+            if not exists:
+                self.cursor.execute(self._tests_ddl())
+                self.conn.commit()
+                return
             cols = [r[1] for r in self.cursor.execute("PRAGMA table_info(tests)").fetchall()]
             if "packet_loss" not in cols:
                 self.cursor.execute("ALTER TABLE tests ADD COLUMN packet_loss REAL")
-                self.conn.commit()
+                cols.append("packet_loss")
+            if set(self.TWEAK_COLUMNS) - set(cols):
+                # Older unique keys did not include the tweak columns, which would collapse every
+                # Amnezia/TLS/routing variant into one row. Recreate so each variant is its own row.
+                tweaks = ", ".join(c if c in cols else "''" for c in self.TWEAK_COLUMNS)
+                self.cursor.execute(self._tests_ddl().replace("CREATE TABLE tests", "CREATE TABLE tests_new", 1))
+                self.cursor.execute(f'''
+                    INSERT INTO tests_new
+                    (location, city, country, protocol, port, awg, tls, routing, status, duration, ping,
+                     packet_loss, profile_name, timestamp)
+                    SELECT location, city, country, protocol, port, {tweaks}, status, duration, ping,
+                           packet_loss, profile_name, timestamp FROM tests
+                ''')
+                self.cursor.execute("DROP TABLE tests")
+                self.cursor.execute("ALTER TABLE tests_new RENAME TO tests")
+            self.conn.commit()
 
-    def record_result(self, location, city, country, proto, port, status, duration, ping, loss, profile_name):
+    def record_result(self, location, city, country, proto, port, awg, tls, routing, status, duration, ping, loss,
+                      profile_name):
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with self.lock:
             try:
                 self.cursor.execute('''
                     INSERT OR REPLACE INTO tests
-                    (location, city, country, protocol, port, status, duration, ping, packet_loss, profile_name, timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (location, city, country, proto, port, status, round(duration, 2), ping, loss,
-                      profile_name, timestamp))
+                    (location, city, country, protocol, port, awg, tls, routing, status, duration, ping,
+                     packet_loss, profile_name, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (location, city, country, proto, port, awg or "", tls or "", routing or "", status,
+                      round(duration, 2), ping, loss, profile_name, timestamp))
                 self.conn.commit()
                 return True
             except Exception as e:
@@ -440,18 +590,19 @@ class DatabaseManager:
             except Exception:
                 return 0
 
-    def is_tested(self, location, city, country, proto, port):
+    def is_tested(self, location, city, country, proto, port, awg="", tls="", routing=""):
         with self.lock:
             self.cursor.execute(
-                "SELECT 1 FROM tests WHERE location=? AND city=? AND country=? AND protocol=? AND port=?",
-                (location, city, country, proto, port))
+                "SELECT 1 FROM tests WHERE location=? AND city=? AND country=? AND protocol=? AND port=? "
+                "AND awg=? AND tls=? AND routing=?",
+                (location, city, country, proto, port, awg or "", tls or "", routing or ""))
             return self.cursor.fetchone() is not None
 
     def fetch_results(self):
         with self.lock:
             self.cursor.execute(
-                "SELECT city, location, country, protocol, port, status, duration, ping, packet_loss "
-                "FROM tests ORDER BY id")
+                "SELECT city, location, country, protocol, port, awg, tls, routing, status, duration, ping, "
+                "packet_loss FROM tests ORDER BY id")
             return self.cursor.fetchall()
 
     def export_to_csv(self, current_profile_name="Manual"):
@@ -498,13 +649,15 @@ class WindscribeWorker:
     # Steps of one test, as shown in the UI.
     DISCONNECT, CONNECT, SETTLE, PING = range(4)
 
-    def __init__(self, app_instance, cli_cmd=DEFAULT_CLI):
+    def __init__(self, app_instance, cli_cmd=None):
         self.app = app_instance
         self.db = DatabaseManager(app=app_instance)
         self.pinger = PingRunner()
         self.stop_event = threading.Event()
         self.running = False
-        self.cli_cmd = cli_cmd
+        self.cli_argv = cli_cmd if isinstance(cli_cmd, list) else (resolve_cli(cli_cmd or DEFAULT_CLI) or [DEFAULT_CLI])
+        self._tweaks_applied = None
+        self._conf_backup = None  # conf text before this job's first write; restored when the job ends
 
     # -- helpers (all UI access goes through app.post, never touches widgets directly) --
     def log(self, msg, tag="INFO"):
@@ -513,17 +666,58 @@ class WindscribeWorker:
     def phase(self, idx, state, secs=None):
         self.app.post(self.app.set_phase, idx, state, secs)
 
-    def run_cli(self, args, timeout=30):
-        cmd = [self.cli_cmd] + args
+    def run_argv(self, argv, timeout=30, stdin=None):
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                    timeout=timeout, **hidden_process_kwargs())
+            result = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                    input=stdin, timeout=timeout, **hidden_process_kwargs())
             return result.returncode, result.stdout
         except subprocess.TimeoutExpired:
             return -1, ""
         except Exception as e:
             self.log(f"CLI Error: {e}", "FAILURE")
             return -1, ""
+
+    def run_cli(self, args, timeout=30):
+        return self.run_argv(list(self.cli_argv) + args, timeout=timeout)
+
+    def write_conf(self, text):
+        prefix = wsl_prefix(self.cli_argv) or []
+        code, _out = self.run_argv(prefix + _WRITE_CONF, timeout=20, stdin=text)
+        if code != 0:
+            self.log("Could not write windscribe_cli.conf", "FAILURE")
+            return False
+        # shortcut: the CLI reloads the conf from a file watcher and a routing change refetches the API
+        # session; 0.5 s is enough locally. Bump it if alternate-routing tests fail only on the first try.
+        self.stop_event.wait(0.5)
+        return True
+
+    def apply_tweaks(self, awg, tls, routing):
+        """Write the Linux CLI conf so the next connect uses these tweaks (all empty = Windscribe defaults)."""
+        tweaks = (awg or "", tls or "", routing or "")
+        if self._tweaks_applied == tweaks:
+            return True
+        if not linux_cli(self.cli_argv):
+            if any(tweaks):
+                self.log("Censorship tweaks need the Linux windscribe-cli.", "FAILURE")
+                return False
+            return True
+        prefix = wsl_prefix(self.cli_argv) or []
+        code, current = self.run_argv(prefix + _READ_CONF, timeout=20)
+        if code != 0:
+            self.log("Could not read windscribe_cli.conf", "FAILURE")
+            return False
+        if self._conf_backup is None:
+            self._conf_backup = current
+        if not self.write_conf(patch_conf(current, *tweaks)):
+            return False
+        self._tweaks_applied = tweaks
+        return True
+
+    def restore_conf(self):
+        if self._conf_backup is not None and self.write_conf(self._conf_backup):
+            self.log("Restored windscribe_cli.conf", "INFO")
+        self._conf_backup = None
+        self._tweaks_applied = None
 
     @staticmethod
     def is_connected_output(out):
@@ -574,7 +768,7 @@ class WindscribeWorker:
 
     def _connect_one(self, r, timeout):
         connected = False
-        route = f"{r['proto']}:{r['port']}"
+        route = route_label(r)
         try:
             self.log(f"Connecting to {r['city']} via {route}", "HEADER")
             self.phase(self.DISCONNECT, "active")
@@ -584,9 +778,12 @@ class WindscribeWorker:
                 self.log("Could not disconnect the current session first.", "FAILURE")
                 return
             self.phase(self.DISCONNECT, "done", time.time() - t0)
+            if not self.apply_tweaks(r.get("awg"), r.get("tls"), r.get("routing")):
+                self.phase(self.CONNECT, "fail")
+                return
             self.phase(self.CONNECT, "active")
             start_ts = time.time()
-            self.run_cli(["connect", "-n", r["city"], route], timeout=timeout + 15)
+            self.run_cli(["connect", "-n", r["city"], f"{r['proto']}:{r['port']}"], timeout=timeout + 15)
             connected, duration = self.wait_for_connection(start_ts, timeout)
             if connected:
                 self.phase(self.CONNECT, "done", duration)
@@ -597,6 +794,8 @@ class WindscribeWorker:
         except Exception as e:
             self.log(f"Critical Error: {e}", "FAILURE")
         finally:
+            if not connected:
+                self.restore_conf()
             self.running = False
             self.app.post(self.app.manual_connect_finished, r, connected)
 
@@ -605,6 +804,8 @@ class WindscribeWorker:
         try:
             done = self.ensure_disconnected()
             self.log("Disconnected." if done else "Could not disconnect.", "INFO" if done else "FAILURE")
+            if done:
+                self.restore_conf()
         finally:
             self.running = False
             self.app.post(self.app.disconnect_finished, done)
@@ -614,7 +815,9 @@ class WindscribeWorker:
         locations = [l for l in LocationManager.load_locations() if not keys or loc_key(l) in keys]
         if opts["random_cities"]:
             random.shuffle(locations)
-        tasks = [(loc, proto, port) for loc in locations for proto, ports in work_plan.items() for port in ports]
+        routes = expand_routes(work_plan, opts.get("awg_presets") or [], opts.get("tls_mode", "off"),
+                               opts.get("routing_mode", "auto"))
+        tasks = [(loc,) + route for loc in locations for route in routes]
         if opts["chaos_mode"]:
             random.shuffle(tasks)
         return locations, tasks
@@ -632,14 +835,15 @@ class WindscribeWorker:
             total = len(tasks)
             self.log(f"Queued {len(locations)} locations, {total} tests", "HEADER")
 
-            for i, (loc, proto, port) in enumerate(tasks, 1):
+            for i, (loc, proto, port, awg, tls, routing) in enumerate(tasks, 1):
                 if self.stop_event.is_set():
                     break
 
                 city, node, country = loc["city"], loc["location"], loc["country"]
-                route = f"{proto}:{port}"
+                key = (node, city, country, proto, port, awg, tls, routing)
+                route = route_label({"proto": proto, "port": port, "awg": awg, "tls": tls, "routing": routing})
 
-                if opts["resume"] and self.db.is_tested(node, city, country, proto, port):
+                if opts["resume"] and self.db.is_tested(*key):
                     continue
 
                 executed += 1
@@ -656,18 +860,23 @@ class WindscribeWorker:
                 if self.stop_event.is_set():
                     break
 
+                if not self.apply_tweaks(awg, tls, routing):
+                    # One broken conf write would fail every remaining test the same way; stop instead.
+                    self.phase(self.CONNECT, "fail")
+                    self.log("Could not apply censorship tweaks, stopping.", "FAILURE")
+                    break
+
                 self.phase(self.CONNECT, "active")
                 start_ts = time.time()
-                self.run_cli(["connect", "-n", city, route], timeout=opts["timeout"] + 15)
+                self.run_cli(["connect", "-n", city, f"{proto}:{port}"], timeout=opts["timeout"] + 15)
                 self.stop_event.wait(1)
 
                 _, status_out = self.run_cli(["status"])
                 if "Location does not exist" in status_out or "is disabled" in status_out:
                     self.phase(self.CONNECT, "fail")
                     self.log(f"{city} is unavailable, skipping.", "FAILURE")
-                    self.db.record_result(node, city, country, proto, port, "INVALID_LOC", 0, None, None,
-                                          opts["profile_name"])
-                    self.app.post(self.app.add_result_row, city, node, country, proto, port,
+                    self.db.record_result(*key, "INVALID_LOC", 0, None, None, opts["profile_name"])
+                    self.app.post(self.app.add_result_row, city, node, country, proto, port, awg, tls, routing,
                                   "INVALID_LOC", 0, None, None)
                     fail += 1
                     continue
@@ -697,7 +906,8 @@ class WindscribeWorker:
 
                     self.phase(self.PING, "active")
                     t0 = time.time()
-                    result, err = self.pinger.run(opts["ping_host"], opts["ping_count"])
+                    result, err = self.pinger.run(opts["ping_host"], opts["ping_count"],
+                                                  wsl=wsl_prefix(self.cli_argv))
                     self.phase(self.PING, "done" if result else "fail", time.time() - t0)
                     self.app.post(self.app.set_ping, result)
                     if result:
@@ -711,10 +921,9 @@ class WindscribeWorker:
                     self.phase(self.CONNECT, "fail", opts["timeout"])
                     self.log(f"Timed out on {route}", "FAILURE")
 
-                self.db.record_result(node, city, country, proto, port, status_str, duration, ping_avg, loss,
-                                      opts["profile_name"])
-                self.app.post(self.app.add_result_row, city, node, country, proto, port, status_str,
-                              duration, ping_avg, loss)
+                self.db.record_result(*key, status_str, duration, ping_avg, loss, opts["profile_name"])
+                self.app.post(self.app.add_result_row, city, node, country, proto, port, awg, tls, routing,
+                              status_str, duration, ping_avg, loss)
 
                 if connected and opts["stop_on_success"]:
                     kept_connection = f"{loc_name(city, node)} · {route}"
@@ -727,6 +936,8 @@ class WindscribeWorker:
         except Exception as e:
             self.log(f"Critical Error: {e}", "FAILURE")
         finally:
+            if not kept_connection:
+                self.restore_conf()
             self.running = False
             self.app.post(self.app.job_finished, kept_connection, ok, fail)
 
@@ -1219,7 +1430,7 @@ class App(ctk.CTk):
     SORT_KEYS = {
         "#0": lambda r: (r["city"].lower(), r["node"].lower()),
         "country": lambda r: r["country"].lower(),
-        "route": lambda r: (r["proto"], r["port"]),
+        "route": lambda r: (r["proto"], r["port"], r["awg"], r["tls"], r["routing"]),
         "status": lambda r: r["status"],
         "time": lambda r: r["duration"] if r["status"] == "SUCCESS" else float("inf"),
         "ping": lambda r: r["ping"] if r["ping"] is not None else float("inf"),
@@ -1283,6 +1494,7 @@ class App(ctk.CTk):
 
         self.init_vars()
         self.setup_ui()
+        self._cli_ok = None  # argv tuple that last passed cli_probe
         self.worker = WindscribeWorker(self, resolve_cli(self.entry_cli.get()) or DEFAULT_CLI)
         self.apply_config_to_ui(self.last_settings)
         self.reload_results_table()
@@ -1328,6 +1540,14 @@ class App(ctk.CTk):
             saved_ports = saved_protocols.get(proto, {}).get("ports", {})
             for port in ports:
                 self.port_vars[proto][port] = ctk.BooleanVar(value=saved_ports.get(str(port), True))
+        self.load_tweaks(self.last_settings)
+
+    def load_tweaks(self, s):
+        saved_awg = list(s.get("awg_presets") or [])
+        self.awg_order = saved_awg
+        self.awg_enabled = set(saved_awg)
+        self.tls_mode = s.get("tls_mode") if s.get("tls_mode") in TLS_VALUES else "off"
+        self.routing_mode = s.get("routing_mode") if s.get("routing_mode") in ROUTING_VALUES else "auto"
 
     def text_width(self, text, font):
         """Width in CustomTkinter's unscaled units."""
@@ -1496,6 +1716,19 @@ class App(ctk.CTk):
         self.protocol_container = ctk.CTkFrame(scroll, fg_color=BORDER, corner_radius=10)
         self.protocol_container.pack(fill="x", padx=px)
         self.refresh_protocol_list()
+
+        # --- Censorship tweaks (shown only for the Linux CLI, see refresh_cli_status) ---
+        self.censor_card = ctk.CTkFrame(scroll, fg_color=ROW, corner_radius=10)
+        self.censor_px = px
+        caps(self.censor_card, t("censorship"), TEXT_2).pack(fill="x", padx=12, pady=(8, 0))
+        awg_row = frame(self.censor_card)
+        awg_row.pack(fill="x", padx=4)
+        ctk.CTkLabel(awg_row, text=t("amnezia"), font=sans(12), text_color=TEXT).pack(side=start(), padx=8, pady=6)
+        self.btn_awg = ghost_button(awg_row, "", self.open_awg_dialog, width=120, height=24, font=sans(11))
+        self.btn_awg.pack(side=end(), padx=4, pady=4)
+        self.seg_tls = self.make_mode_picker(t("large_tls"), "tls_mode", TLS_VALUES)
+        self.seg_routing = self.make_mode_picker(t("routing"), "routing_mode", ROUTING_VALUES)
+        self.update_awg_summary()
 
         # --- Options ---
         caps(scroll, t("options")).pack(fill="x", padx=px, pady=(20, 4))
@@ -2017,7 +2250,7 @@ class App(ctk.CTk):
         if best:
             self.lbl_rec_name.configure(text=loc_name(best["city"], best["node"]))
             self.lbl_rec_country.configure(text=best["country"])
-            self.lbl_rec_route.configure(text=f" {best['proto']}:{best['port']} ")
+            self.lbl_rec_route.configure(text=f" {route_label(best)} ")
             self.rec_stats["ping"].configure(text=f"{best['ping']:.0f} {t('ms')}", text_color=ping_color(best["ping"]))
             self.rec_stats["loss"].configure(text=f"{best['loss']:.0f}%" if best["loss"] is not None else "–")
             self.rec_stats["time"].configure(text=t("secs", v=f"{best['duration']:.1f}"))
@@ -2117,18 +2350,18 @@ class App(ctk.CTk):
         self.after(1000, self._tick)
 
     # ---------------- results ----------------
-    def add_result_row(self, city, node, country, proto, port, status, duration, ping, loss):
-        self.results.append({"id": len(self.results), "city": city, "node": node or "", "country": country,
-                             "proto": proto, "port": port, "status": status, "duration": duration or 0,
-                             "ping": ping, "loss": loss})
+    @staticmethod
+    def result_row(idx, city, node, country, proto, port, awg, tls, routing, status, duration, ping, loss):
+        return {"id": idx, "city": city, "node": node or "", "country": country, "proto": proto, "port": port,
+                "awg": awg or "", "tls": tls or "", "routing": routing or "", "status": status,
+                "duration": duration or 0, "ping": ping, "loss": loss}
+
+    def add_result_row(self, *row):
+        self.results.append(self.result_row(len(self.results), *row))
         self.render_data()
 
     def reload_results_table(self):
-        self.results = []
-        for city, node, country, proto, port, status, duration, ping, loss in self.worker.db.fetch_results():
-            self.results.append({"id": len(self.results), "city": city, "node": node or "", "country": country,
-                                 "proto": proto, "port": port, "status": status, "duration": duration or 0,
-                                 "ping": ping, "loss": loss})
+        self.results = [self.result_row(i, *row) for i, row in enumerate(self.worker.db.fetch_results())]
         self.render_data()
 
     def render_data(self):
@@ -2154,7 +2387,7 @@ class App(ctk.CTk):
         return t(key) if key in i18n.STRINGS else status
 
     def result_values(self, r):
-        return (r["country"], f"{r['proto']}:{r['port']}", self.status_label(r["status"]),
+        return (r["country"], route_label(r), self.status_label(r["status"]),
                 t("secs", v=f"{r['duration']:.1f}") if r["status"] == "SUCCESS" else "–",
                 f"{r['ping']:.0f} {t('ms')}" if r["ping"] is not None else "–",
                 f"{r['loss']:.0f}%" if r["loss"] is not None else "–")
@@ -2178,7 +2411,7 @@ class App(ctk.CTk):
             if self.result_filter == "Failed" and r["status"] == "SUCCESS":
                 continue
             if query:
-                hay = f"{loc_name(r['city'], r['node'])} {r['country']} {r['proto']}:{r['port']} " \
+                hay = f"{loc_name(r['city'], r['node'])} {r['country']} {route_label(r)} " \
                       f"{self.status_label(r['status'])}".lower()
                 if not all(tok in hay for tok in query.split()):
                     continue
@@ -2211,7 +2444,7 @@ class App(ctk.CTk):
         for n, r in enumerate(rows[:100], 1):
             self.tree_insert(self.best_tree, str(r["id"]), f"{n}.  {loc_name(r['city'], r['node'])}",
                              self.dots[ping_quality(r["ping"])],
-                             (r["country"], f"{r['proto']}:{r['port']}", f"{r['ping']:.0f} {t('ms')}",
+                             (r["country"], route_label(r), f"{r['ping']:.0f} {t('ms')}",
                               f"{r['loss']:.0f}%" if r["loss"] is not None else "–",
                               t("secs", v=f"{r['duration']:.1f}")),
                              ("odd" if n % 2 == 0 else "even",))
@@ -2300,7 +2533,7 @@ class App(ctk.CTk):
         if not r:
             return
         if what == "route":
-            text = f"{r['city']}  {r['proto']}:{r['port']}"
+            text = f"{r['city']}  {route_label(r)}"
         else:
             text = "\t".join((loc_name(r["city"], r["node"]),) + self.result_values(r))
         self.clipboard_clear()
@@ -2419,15 +2652,24 @@ class App(ctk.CTk):
         self.update_scope_preview(user_change=True)
         self.save_all_config()
 
+    def tweak_opts(self):
+        """Matrix inputs for expand_routes; a Windows exe always gets upstream's plain plan."""
+        if not linux_cli(resolve_cli(self.entry_cli.get())):
+            return [], "off", "auto"
+        return self.selected_awg(), self.tls_mode, self.routing_mode
+
+    def route_count(self):
+        return len(expand_routes(self.get_plan(), *self.tweak_opts()))
+
     def test_count(self):
-        return len(self.scope_locations()) * sum(len(p) for p in self.get_plan().values())
+        return len(self.scope_locations()) * self.route_count()
 
     def update_scope_preview(self, user_change=False):
         if not hasattr(self, "btn_start") or not hasattr(self, "lbl_scope_tests"):
             return
         title, sub = self.scope_summary()
         servers = len(self.scope_locations())
-        routes = sum(len(p) for p in self.get_plan().values())
+        routes = self.route_count()
         tests = servers * routes
         self.lbl_scope_title.configure(text=trunc(title, 30))
         self.lbl_scope_sub.configure(text=sub)
@@ -2516,6 +2758,116 @@ class App(ctk.CTk):
         dialog.bind("<Return>", lambda _e: done())
         primary_button(dialog, t("done"), done, height=36).pack(fill="x", padx=18, pady=(0, 16))
 
+    def selected_awg(self):
+        return [name for name in self.awg_order if name in self.awg_enabled]
+
+    def make_mode_picker(self, title, attr, modes):
+        row = frame(self.censor_card)
+        row.pack(fill="x", padx=12, pady=(2, 8))
+        label(row, title, 12).pack(fill="x")
+        names = {t(f"mode_{m}"): m for m in modes}
+
+        def pick(name):
+            setattr(self, attr, names[name])
+            self.update_scope_preview(user_change=True)
+            self.save_all_config()
+
+        seg = ctk.CTkSegmentedButton(
+            row, values=list(names), command=pick, height=26, font=sans(11),
+            fg_color=DEEP, selected_color="#20262F", selected_hover_color="#262D37", unselected_color=DEEP,
+            unselected_hover_color=HOVER, text_color=TEXT, corner_radius=8)
+        seg.set(t(f"mode_{getattr(self, attr)}"))
+        seg.pack(fill="x", pady=(4, 0))
+        return seg
+
+    def list_awg_presets(self):
+        argv = resolve_cli(self.entry_cli.get())
+        if not argv:
+            return None
+        try:
+            result = subprocess.run(list(argv) + ["amneziawg"], capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=30, **hidden_process_kwargs())
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        return [line.strip() for line in result.stdout.splitlines() if " - " in line]
+
+    def open_awg_dialog(self):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title(vis(t("amnezia_title")))
+        place_dialog(dialog, self, 460, 520, top=100)
+        dialog.resizable(False, True)
+        label(dialog, t("amnezia_title"), 16, bold=True).pack(fill="x", padx=18, pady=(16, 0))
+        label(dialog, t("amnezia_hint"), 11, MUTED, wraplength=420).pack(fill="x", padx=18)
+        lbl_status = label(dialog, t("amnezia_loading"), 11, MUTED, wraplength=420)
+        lbl_status.pack(fill="x", padx=18, pady=(8, 0))
+        checks = {}
+        state = {"live": None}
+
+        def set_all(value):
+            for var in checks.values():
+                var.set(value)
+
+        top = frame(dialog)
+        top.pack(fill="x", padx=18, pady=(10, 0))
+        ghost_button(top, t("select_all"), lambda: set_all(True),
+                     width=self.text_width(t("select_all"), sans(12)) + 28, height=28).pack(side=start())
+        ghost_button(top, t("select_none"), lambda: set_all(False),
+                     width=self.text_width(t("select_none"), sans(12)) + 28, height=28).pack(side=start(), padx=6)
+
+        scroll = ctk.CTkScrollableFrame(dialog, fg_color=CARD, corner_radius=10, border_width=1, border_color=BORDER)
+        scroll.pack(fill="both", expand=True, padx=18, pady=10)
+
+        def fill(names):
+            for w in scroll.winfo_children():
+                w.destroy()
+            checks.clear()
+            if not names:
+                label(scroll, t("amnezia_empty"), 11, MUTED, wraplength=400).pack(anchor=a_start(), padx=10, pady=8)
+            for name in names:
+                checks[name] = var = ctk.BooleanVar(value=name in self.awg_enabled)
+                ctk.CTkCheckBox(scroll, text=name, variable=var, font=sans(12), checkbox_width=18,
+                                checkbox_height=18, fg_color=ACCENT, hover_color=ACCENT_HOVER, border_color=DIM,
+                                checkmark_color=ON_ACCENT, border_width=2, corner_radius=4).pack(
+                    anchor=a_start(), pady=4, padx=10)
+
+        def fetched(live):
+            if not dialog.winfo_exists():
+                return
+            state["live"] = live
+            if live is None:
+                lbl_status.configure(text=t("amnezia_empty"), text_color=WARN)
+            else:
+                lbl_status.pack_forget()
+                fill(live)
+
+        fill(list(self.awg_order))
+        # The CLI call can take seconds on a cold WSL distro; keep the window responsive meanwhile.
+        threading.Thread(target=lambda: self.post(fetched, self.list_awg_presets()), daemon=True).start()
+
+        def done():
+            if state["live"] is not None:
+                self.awg_order = list(checks)
+            self.awg_enabled = {name for name, var in checks.items() if var.get()}
+            self.update_awg_summary()
+            self.update_scope_preview(user_change=True)
+            self.save_all_config()
+            dialog.grab_release()
+            dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", done)
+        dialog.bind("<Escape>", lambda _e: done())
+        dialog.bind("<Return>", lambda _e: done())
+        primary_button(dialog, t("done"), done, height=36).pack(fill="x", padx=18, pady=(0, 16))
+
+    def update_awg_summary(self):
+        chosen = self.selected_awg()
+        txt = t("amnezia_off") if not chosen else t("amnezia_n", n=len(chosen))
+        if hasattr(self, "btn_awg"):
+            self.btn_awg.configure(text=txt, text_color=TEXT_2 if chosen else MUTED,
+                                   width=max(72, self.text_width(txt, sans(11)) + 28))
+
     def update_summary(self, proto):
         active = [p for p, v in self.port_vars[proto].items() if v.get()]
         total = len(self.port_vars[proto])
@@ -2559,21 +2911,46 @@ class App(ctk.CTk):
         self.btn_timing.configure(text=f"{arrow}   {summary}")
 
     # ---------------- CLI ----------------
-    def refresh_cli_status(self):
+    def refresh_cli_status(self, probe=True):
         path = resolve_cli(self.entry_cli.get())
-        if path:
-            self.cli_pill.configure(fg_color=GOOD_SOFT, border_color=GOOD_LINE)
-            self.cli_dot.configure(text_color=GOOD)
-            self.cli_text.configure(text=t("cli_ready"), text_color=GOOD_TEXT)
-            self.rail_dot.configure(text_color=GOOD)
-            if hasattr(self, "worker") and not self.worker.running:
-                self.worker.cli_cmd = path
+        if linux_cli(path):
+            self.censor_card.pack(fill="x", padx=self.censor_px, pady=(8, 0), after=self.protocol_container)
         else:
-            self.cli_pill.configure(fg_color=BAD_SOFT, border_color=BAD_LINE)
-            self.cli_dot.configure(text_color=BAD)
-            self.cli_text.configure(text=t("cli_missing"), text_color=BAD_TEXT)
-            self.rail_dot.configure(text_color=BAD)
+            self.censor_card.pack_forget()
+        self.update_scope_preview()
+        if not path:
+            self.set_cli_badge("missing")
+            return None
+        worker = getattr(self, "worker", None)
+        running = worker is not None and worker.running
+        if worker is not None and not running:
+            worker.cli_argv = path
+        # shortcut: a passed probe is trusted for the rest of the session; re-probe on job start if users
+        # uninstall the CLI mid-session.
+        if tuple(path) == self._cli_ok:
+            self.set_cli_badge("ready")
+        elif probe and not running:
+            # "windscribe-cli help" runs off the UI thread: a cold WSL start takes seconds. The CLI allows
+            # one instance at a time, so callers about to start a job pass probe=False.
+            self.set_cli_badge("checking")
+            threading.Thread(target=lambda: self.post(self.cli_probed, path, cli_probe(path)), daemon=True).start()
         return path
+
+    def cli_probed(self, argv, ok):
+        if ok:
+            self._cli_ok = tuple(argv)
+        if resolve_cli(self.entry_cli.get()) == argv:  # the entry may have changed while the probe ran
+            self.set_cli_badge("ready" if ok else "missing")
+
+    CLI_BADGE = {"ready": (GOOD_SOFT, GOOD_LINE, GOOD, GOOD_TEXT), "checking": (WARN_SOFT, BORDER_2, WARN, WARN_TEXT),
+                 "missing": (BAD_SOFT, BAD_LINE, BAD, BAD_TEXT)}
+
+    def set_cli_badge(self, state):
+        bg, line, dot, fg = self.CLI_BADGE[state]
+        self.cli_pill.configure(fg_color=bg, border_color=line)
+        self.cli_dot.configure(text_color=dot)
+        self.cli_text.configure(text=t(f"cli_{state}"), text_color=fg)
+        self.rail_dot.configure(text_color=dot)
 
     def focus_cli_entry(self):
         if resolve_cli(self.entry_cli.get()):
@@ -2642,7 +3019,11 @@ class App(ctk.CTk):
                         self.port_vars[proto][port_int].set(enabled)
 
         self.priority_order = self.sanitize_priority(s.get("priority_order"))
+        self.load_tweaks(s)
         self.refresh_protocol_list()
+        self.update_awg_summary()
+        self.seg_tls.set(t(f"mode_{self.tls_mode}"))
+        self.seg_routing.set(t(f"mode_{self.routing_mode}"))
 
     def gather_config_data(self):
         data = {
@@ -2657,6 +3038,9 @@ class App(ctk.CTk):
             "stop_on_success": bool(self.sw_stop_success.get()),
             "priority_order": list(self.priority_order),
             "protocols": {},
+            "awg_presets": self.selected_awg(),
+            "tls_mode": self.tls_mode,
+            "routing_mode": self.routing_mode,
         }
         for proto, p_var in self.protocol_vars.items():
             data["protocols"][proto] = {
@@ -2782,7 +3166,7 @@ class App(ctk.CTk):
         if not plan:
             self.toast(t("need_protocol"), "warn")
             return
-        cli = self.refresh_cli_status()
+        cli = self.refresh_cli_status(probe=False)
         if not cli:
             self.focus_cli_entry()
             return
@@ -2817,13 +3201,15 @@ class App(ctk.CTk):
                     "current": 0, "total": self.test_count()}
         self.step = None
         self.set_connected(None)
+        presets, tls_mode, routing_mode = self.tweak_opts()
         opts = {
             "keys": set(self.selected_keys), "resume": resume, "timeout": timeout, "settle": settle,
             "ping_count": ping_count, "ping_host": host,
             "random_cities": bool(self.sw_random_cities.get()), "chaos_mode": bool(self.sw_chaos.get()),
             "stop_on_success": bool(self.sw_stop_success.get()), "profile_name": profile_name,
+            "awg_presets": presets, "tls_mode": tls_mode, "routing_mode": routing_mode,
         }
-        self.worker.cli_cmd = cli
+        self.worker.cli_argv = cli
         self.worker.start(plan, opts)
         self.set_running_ui(True)
         self.show_hero("live")
@@ -2870,7 +3256,7 @@ class App(ctk.CTk):
         if self.worker.running:
             self.toast(t("wait_run"), "warn")
             return
-        cli = self.refresh_cli_status()
+        cli = self.refresh_cli_status(probe=False)
         if not cli:
             self.focus_cli_entry()
             return
@@ -2878,19 +3264,19 @@ class App(ctk.CTk):
             timeout = max(3, min(300, int(self.entry_timeout.get().strip())))
         except ValueError:
             timeout = 25
-        self.worker.cli_cmd = cli
+        self.worker.cli_argv = cli
         self.set_connected(None)
         self.worker.connect_to(r, timeout)
         self.set_running_ui(True)
         self.show_hero("live")
-        self.set_target("cap_connecting", r["city"], r["node"], r["country"], f"{r['proto']}:{r['port']}")
+        self.set_target("cap_connecting", r["city"], r["node"], r["country"], route_label(r))
         self.progress_bar.show(0)
         self.lbl_prog_left.configure(text=t("manual_connection"))
         self.lbl_prog_right.configure(text="")
 
     def manual_connect_finished(self, r, connected):
         self.set_running_ui(False)
-        route = f"{r['proto']}:{r['port']}"
+        route = route_label(r)
         where = loc_name(r["city"], r["node"])
         if connected:
             self.set_connected(f"{where} · {route}")
@@ -2902,11 +3288,11 @@ class App(ctk.CTk):
     def disconnect_vpn(self):
         if self.worker.running:
             return
-        cli = self.refresh_cli_status()
+        cli = self.refresh_cli_status(probe=False)
         if not cli:
             self.focus_cli_entry()
             return
-        self.worker.cli_cmd = cli
+        self.worker.cli_argv = cli
         self.worker.disconnect()
         self.set_running_ui(True, stoppable=False)
         self.btn_stop.configure(text=t("disconnecting"))
@@ -2974,7 +3360,44 @@ def restart():
     subprocess.Popen(cmd, cwd=APP_PATH, env=env)
 
 
+def _self_check():
+    # Plain plan equals upstream: one route per port, every tweak empty.
+    assert expand_routes({"wireguard": [443, 80]}, []) == [("wireguard", 443, "", "", ""), ("wireguard", 80, "", "", "")]
+    # One preset x TLS both x routing both = 4 WireGuard routes per port; udp gets the same 4 without a preset.
+    routes = expand_routes({"wireguard": [443], "udp": [443]}, ["A - one"], "both", "both")
+    assert [r for r in routes if r[0] == "wireguard"] == [
+        ("wireguard", 443, "A - one", "", "regular"), ("wireguard", 443, "A - one", "", "alternate"),
+        ("wireguard", 443, "A - one", "on", "regular"), ("wireguard", 443, "A - one", "on", "alternate")]
+    assert [r[2:] for r in routes if r[0] == "udp"] == [("", "", "regular"), ("", "", "alternate"),
+                                                         ("", "on", "regular"), ("", "on", "alternate")]
+    assert len(expand_routes({"wireguard": [443, 80]}, ["A", "B"], "on", "auto")) == 4
+    text = patch_conf("[General]\nLanguage=en\n\n[Connection]\nProtocolTweaksMethod=0\n", "A - one", "on", "alternate")
+    assert "ProtocolTweaksMethod=1\n" in text and "AmneziawgPreset=A - one\n" in text
+    assert "CircumventCensorship=true\n" in text and "ServerRoutingMethod=2\n" in text
+    assert text.count("ProtocolTweaksMethod=") == 1 and text.startswith("[General]\nLanguage=en\n")
+    off = patch_conf(text, "", "", "")
+    assert "ProtocolTweaksMethod=2\n" in off and "AmneziawgPreset=\n" in off
+    assert "CircumventCensorship=false\n" in off and "ServerRoutingMethod=0\n" in off
+    assert "[Connection]" in patch_conf("", "", "", "regular")
+    assert route_label({"proto": "udp", "port": 443}) == "udp:443"
+    assert route_label({"proto": "wireguard", "port": 443, "awg": "A - one", "tls": "on",
+                        "routing": "alternate"}) == "wireguard:443 · A · TLS · alt"
+    wsl = ["wsl", "-d", "Ubuntu", "-u", "ubroot", "--", "windscribe-cli"]
+    assert wsl_prefix(wsl) == wsl[:-1] and linux_cli(wsl)
+    assert wsl_prefix([r"C:\Program Files\Windscribe\windscribe-cli.exe"]) is None
+    assert linux_cli([r"C:\Program Files\Windscribe\windscribe-cli.exe"]) == (platform.system() == "Linux")
+    # The command must end in the CLI itself; an existing but unrelated program is not "ready".
+    assert resolve_cli("wsl") is None and resolve_cli("wsl -d Ubuntu --") is None
+    assert resolve_cli(sys.executable) is None
+    if " " not in sys.executable:
+        assert resolve_cli(f"{sys.executable} -- windscribe-cli") == [sys.executable, "--", "windscribe-cli"]
+    print("self-check ok")
+
+
 def main():
+    if "--self-check" in sys.argv:
+        _self_check()
+        return
     app = App()
     app.mainloop()
     if app.relaunch:
