@@ -80,6 +80,30 @@ python main.py
 | Connect timeout | How long to wait for a connection, in seconds (3–300) |
 | Settle delay | Pause after connecting, before pinging (0–60 s) |
 
+## Linux CLI extras: censorship tweaks
+
+The Windows `windscribe-cli.exe` cannot change anti-censorship settings, so with it AutoScribe behaves
+exactly as described above. The **Linux** `windscribe-cli` keeps its settings in
+`~/.config/Windscribe/windscribe_cli.conf`, which AutoScribe can edit between tests. When the CLI path
+points at a Linux CLI, a **Censorship tweaks** card appears under **Protocols**:
+
+- **Amnezia** – pick any of the AmneziaWG presets the CLI offers. Each one is tried on every selected
+  WireGuard port.
+- **Large TLS** – Off, On, or **Test both**.
+- **Server routing** – Auto, Regular, Alternate, or **Test both**.
+
+Every combination becomes its own test, so one WireGuard port with one preset and both toggles on
+"Test both" runs four tests. Results, the Best routes tab and the CSV carry the preset, TLS and routing
+of each row (`awg`, `tls`, `routing` columns; the route reads like `wireguard:443 · A · TLS · alt`).
+The original conf file is restored when the run ends.
+
+Two ways to get a Linux CLI:
+
+- Run AutoScribe on Linux with `windscribe-cli` installed and logged in.
+- On Windows, install the CLI inside WSL (for example Ubuntu), log in there, and set the CLI path to
+  `wsl -d Ubuntu -u <user> -- windscribe-cli`. Pings then run inside WSL too, because a Windows `ping`
+  does not go through the WSL tunnel.
+
 ## Files
 
 | File | Purpose |
