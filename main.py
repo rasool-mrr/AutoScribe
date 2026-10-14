@@ -162,12 +162,23 @@ def resolve_cli(path):
     path = (path or "").strip().strip('"')
     if not path:
         return None
-    if os.path.isfile(path):
-        return [path]
-    parts = shlex.split(path, posix=not IS_WINDOWS)
-    if parts and (os.path.isfile(parts[0]) or shutil.which(parts[0])):
+    parts = [path] if os.path.isfile(path) else shlex.split(path, posix=not IS_WINDOWS)
+    # The last word must be the CLI itself, so a bare "wsl" or "wsl -d Ubuntu --" is not "ready".
+    if not parts or os.path.basename(parts[-1]).lower() not in ("windscribe-cli", "windscribe-cli.exe"):
+        return None
+    if os.path.isfile(parts[0]) or shutil.which(parts[0]):
         return parts
     return None
+
+
+def cli_probe(argv):
+    """True when the command really is windscribe-cli: its help banner names itself, with no service needed."""
+    try:
+        out = subprocess.run(list(argv) + ["help"], capture_output=True, text=True, errors="replace",
+                             timeout=30, **hidden_process_kwargs()).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return "windscribe-cli" in out.lower()
 
 
 def wsl_prefix(argv):
@@ -1483,6 +1494,7 @@ class App(ctk.CTk):
 
         self.init_vars()
         self.setup_ui()
+        self._cli_ok = None  # argv tuple that last passed cli_probe
         self.worker = WindscribeWorker(self, resolve_cli(self.entry_cli.get()) or DEFAULT_CLI)
         self.apply_config_to_ui(self.last_settings)
         self.reload_results_table()
@@ -2899,26 +2911,46 @@ class App(ctk.CTk):
         self.btn_timing.configure(text=f"{arrow}   {summary}")
 
     # ---------------- CLI ----------------
-    def refresh_cli_status(self):
+    def refresh_cli_status(self, probe=True):
         path = resolve_cli(self.entry_cli.get())
         if linux_cli(path):
             self.censor_card.pack(fill="x", padx=self.censor_px, pady=(8, 0), after=self.protocol_container)
         else:
             self.censor_card.pack_forget()
         self.update_scope_preview()
-        if path:
-            self.cli_pill.configure(fg_color=GOOD_SOFT, border_color=GOOD_LINE)
-            self.cli_dot.configure(text_color=GOOD)
-            self.cli_text.configure(text=t("cli_ready"), text_color=GOOD_TEXT)
-            self.rail_dot.configure(text_color=GOOD)
-            if hasattr(self, "worker") and not self.worker.running:
-                self.worker.cli_argv = path
-        else:
-            self.cli_pill.configure(fg_color=BAD_SOFT, border_color=BAD_LINE)
-            self.cli_dot.configure(text_color=BAD)
-            self.cli_text.configure(text=t("cli_missing"), text_color=BAD_TEXT)
-            self.rail_dot.configure(text_color=BAD)
+        if not path:
+            self.set_cli_badge("missing")
+            return None
+        worker = getattr(self, "worker", None)
+        running = worker is not None and worker.running
+        if worker is not None and not running:
+            worker.cli_argv = path
+        # shortcut: a passed probe is trusted for the rest of the session; re-probe on job start if users
+        # uninstall the CLI mid-session.
+        if tuple(path) == self._cli_ok:
+            self.set_cli_badge("ready")
+        elif probe and not running:
+            # "windscribe-cli help" runs off the UI thread: a cold WSL start takes seconds. The CLI allows
+            # one instance at a time, so callers about to start a job pass probe=False.
+            self.set_cli_badge("checking")
+            threading.Thread(target=lambda: self.post(self.cli_probed, path, cli_probe(path)), daemon=True).start()
         return path
+
+    def cli_probed(self, argv, ok):
+        if ok:
+            self._cli_ok = tuple(argv)
+        if resolve_cli(self.entry_cli.get()) == argv:  # the entry may have changed while the probe ran
+            self.set_cli_badge("ready" if ok else "missing")
+
+    CLI_BADGE = {"ready": (GOOD_SOFT, GOOD_LINE, GOOD, GOOD_TEXT), "checking": (WARN_SOFT, BORDER_2, WARN, WARN_TEXT),
+                 "missing": (BAD_SOFT, BAD_LINE, BAD, BAD_TEXT)}
+
+    def set_cli_badge(self, state):
+        bg, line, dot, fg = self.CLI_BADGE[state]
+        self.cli_pill.configure(fg_color=bg, border_color=line)
+        self.cli_dot.configure(text_color=dot)
+        self.cli_text.configure(text=t(f"cli_{state}"), text_color=fg)
+        self.rail_dot.configure(text_color=dot)
 
     def focus_cli_entry(self):
         if resolve_cli(self.entry_cli.get()):
@@ -3134,7 +3166,7 @@ class App(ctk.CTk):
         if not plan:
             self.toast(t("need_protocol"), "warn")
             return
-        cli = self.refresh_cli_status()
+        cli = self.refresh_cli_status(probe=False)
         if not cli:
             self.focus_cli_entry()
             return
@@ -3224,7 +3256,7 @@ class App(ctk.CTk):
         if self.worker.running:
             self.toast(t("wait_run"), "warn")
             return
-        cli = self.refresh_cli_status()
+        cli = self.refresh_cli_status(probe=False)
         if not cli:
             self.focus_cli_entry()
             return
@@ -3256,7 +3288,7 @@ class App(ctk.CTk):
     def disconnect_vpn(self):
         if self.worker.running:
             return
-        cli = self.refresh_cli_status()
+        cli = self.refresh_cli_status(probe=False)
         if not cli:
             self.focus_cli_entry()
             return
@@ -3354,6 +3386,11 @@ def _self_check():
     assert wsl_prefix(wsl) == wsl[:-1] and linux_cli(wsl)
     assert wsl_prefix([r"C:\Program Files\Windscribe\windscribe-cli.exe"]) is None
     assert linux_cli([r"C:\Program Files\Windscribe\windscribe-cli.exe"]) == (platform.system() == "Linux")
+    # The command must end in the CLI itself; an existing but unrelated program is not "ready".
+    assert resolve_cli("wsl") is None and resolve_cli("wsl -d Ubuntu --") is None
+    assert resolve_cli(sys.executable) is None
+    if " " not in sys.executable:
+        assert resolve_cli(f"{sys.executable} -- windscribe-cli") == [sys.executable, "--", "windscribe-cli"]
     print("self-check ok")
 
 
