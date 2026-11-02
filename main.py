@@ -315,6 +315,9 @@ def loc_key(loc):
 def loc_name(city, node):
     return f"{city} – {node}" if node else city
 
+def connect_target(city, node):
+    """The CLI treats a city as 'any server there'. The node name is the specific datacenter."""
+    return node or city
 
 def matches_region(loc, region):
     if region == "All":
@@ -705,7 +708,8 @@ class WindscribeWorker:
             self.phase(self.DISCONNECT, "done", time.time() - t0)
             self.phase(self.CONNECT, "active")
             start_ts = time.time()
-            self.run_cli(["connect", "-n", r["city"], route], timeout=timeout + 15)
+            self.run_cli(["connect", "-n", connect_target(r["city"], r.get("node")), f"{r['proto']}:{r['port']}"],
+                         timeout=timeout + 15)
             connected, duration = self.wait_for_connection(start_ts, timeout)
             if connected:
                 self.phase(self.CONNECT, "done", duration)
@@ -777,7 +781,8 @@ class WindscribeWorker:
 
                 self.phase(self.CONNECT, "active")
                 start_ts = time.time()
-                self.run_cli(["connect", "-n", city, route], timeout=opts["timeout"] + 15)
+                self.run_cli(["connect", "-n", connect_target(city, node), route],
+             timeout=opts["timeout"] + 15)
                 self.stop_event.wait(1)
 
                 _, status_out = self.run_cli(["status"])
