@@ -49,6 +49,7 @@ python -m venv .venv
 pip install -r requirements.txt
 python main.py
 ```
+python main.py --debug shows a Debug switch that runs CLI commands in a visible window.
 
 ## Usage
 
