@@ -17,6 +17,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -151,6 +152,123 @@ def hidden_process_kwargs():
         return {"creationflags": subprocess.CREATE_NO_WINDOW}
     return {}
 
+# (Windows) Debug console: commands run in one visible window so their text can be read. Off by default.
+# The header switch is shown only when the process was started with --debug.
+debug_cli = False
+
+
+def debug_ui_enabled():
+    return "--debug" in sys.argv
+
+
+_debug_dir = os.path.join(tempfile.gettempdir(), "autoscribe_debug")
+_debug_lock = threading.RLock()
+_debug_proc = None
+_DEBUG_PS = r"""
+$root = $env:AUTOSCRIBE_DBG
+Write-Host 'AutoScribe debug. Commands from the app run in this window.'
+while ($true) {
+    $req = Get-ChildItem -LiteralPath $root -Filter '*.req' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $req) { Start-Sleep -Milliseconds 100; continue }
+    $id = $req.BaseName
+    $job = Get-Content -LiteralPath $req.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+    Remove-Item -LiteralPath $req.FullName -Force
+    $out = Join-Path $root "$id.out"
+    Write-Host ''
+    Write-Host ("> " + $job.show) -ForegroundColor Cyan
+    if ($job.stdin) {
+        Write-Host '--- stdin (this is what gets written) ---' -ForegroundColor DarkGray
+        Get-Content -LiteralPath $job.stdin -Encoding UTF8
+        Write-Host '--- end stdin ---' -ForegroundColor DarkGray
+    }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $job.argv[0]
+    $psi.Arguments = $job.args
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    if ($job.stdin) { $psi.RedirectStandardInput = $true }
+    $p = [System.Diagnostics.Process]::Start($psi)
+    if ($job.stdin) {
+        $p.StandardInput.Write($(Get-Content -LiteralPath $job.stdin -Raw -Encoding UTF8))
+        $p.StandardInput.Close()
+    }
+    $err = $p.StandardError.ReadToEndAsync()
+    $text = $p.StandardOutput.ReadToEnd()
+    $p.WaitForExit()
+    [System.IO.File]::WriteAllText($out, $text)
+    [System.IO.File]::WriteAllText((Join-Path $root "$id.code"), "$($p.ExitCode)")
+    if ($err.Result) { Write-Host $err.Result -ForegroundColor Yellow }
+    Write-Host $text
+    Set-Content -LiteralPath (Join-Path $root "$id.done") -Value 1 -Encoding ascii
+}
+"""
+
+
+def open_debug_console():
+    """One console for the whole session. A new one opens only if that window was closed."""
+    global _debug_proc
+    with _debug_lock:
+        if _debug_proc is not None and _debug_proc.poll() is None:
+            return
+        os.makedirs(_debug_dir, exist_ok=True)
+        script = os.path.join(_debug_dir, "console.ps1")
+        with open(script, "w", encoding="utf-8") as f:
+            f.write(_DEBUG_PS)
+        env = os.environ.copy()
+        env["AUTOSCRIBE_DBG"] = _debug_dir
+        _debug_proc = subprocess.Popen(["powershell", "-NoExit", "-File", script], env=env,
+                                       creationflags=subprocess.CREATE_NEW_CONSOLE)
+
+
+def set_debug_cli(on):
+    global debug_cli
+    debug_cli = bool(on)
+    if debug_cli:
+        open_debug_console()
+
+
+def run_captured(argv, timeout, stdin=None):
+    """Run argv. Debug on: the visible console runs it and this waits for the same output."""
+    if not debug_cli:
+        try:
+            result = subprocess.run(list(argv), capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                    input=stdin, timeout=timeout, **hidden_process_kwargs())
+            return result.returncode, result.stdout
+        except subprocess.TimeoutExpired:
+            return -1, ""
+    with _debug_lock:
+        return _run_in_debug_console(argv, timeout, stdin)
+
+
+def _run_in_debug_console(argv, timeout, stdin):
+    os.makedirs(_debug_dir, exist_ok=True)
+    open_debug_console()
+    ident = str(time.time_ns())
+    stdin_path = ""
+    if stdin:
+        stdin_path = os.path.join(_debug_dir, ident + ".in")
+        with open(stdin_path, "w", encoding="utf-8") as f:
+            f.write(stdin)
+    req = os.path.join(_debug_dir, ident + ".req")
+    with open(req, "w", encoding="utf-8") as f:
+        json.dump({"argv": [argv[0]], "args": subprocess.list2cmdline(list(argv[1:])),
+                   "show": subprocess.list2cmdline(list(argv)), "stdin": stdin_path}, f)
+    done = os.path.join(_debug_dir, ident + ".done")
+    deadline = time.time() + timeout + 5
+    while time.time() < deadline:
+        if os.path.exists(done):
+            try:
+                code = int(open(os.path.join(_debug_dir, ident + ".code"), encoding="utf-8").read().strip().split()[0])
+            except (OSError, ValueError):
+                code = -1
+            try:
+                out = open(os.path.join(_debug_dir, ident + ".out"), encoding="utf-8", errors="replace").read()
+            except OSError:
+                out = ""
+            return code, out
+        time.sleep(0.05)
+    return -1, ""
 
 def resolve_cli(path):
     """Returns a usable path to windscribe-cli, or None."""
@@ -354,15 +472,19 @@ class PingRunner:
         else:
             cmd = ["ping", "-c", str(count), "-W", str(max(1, reply_timeout_ms // 1000)), host]
         try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=count * (reply_timeout_ms / 1000 + 1) + 5, **hidden_process_kwargs())
+            code, output = run_captured(
+                cmd,
+                count * (reply_timeout_ms / 1000 + 1) + 5
+            )
         except FileNotFoundError:
             return None, "ping command not found"
-        except subprocess.TimeoutExpired:
-            return None, "ping timed out"
         except Exception as e:
             return None, str(e)
+
+        if code == -1 and not output:
+            return None, "ping timed out"
+
+        times = self.parse(output)
 
         times = self.parse(result.stdout)
         if not times:
@@ -515,12 +637,9 @@ class WindscribeWorker:
 
     def run_cli(self, args, timeout=30):
         cmd = [self.cli_cmd] + args
+
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                    timeout=timeout, **hidden_process_kwargs())
-            return result.returncode, result.stdout
-        except subprocess.TimeoutExpired:
-            return -1, ""
+            return run_captured(cmd, timeout)
         except Exception as e:
             self.log(f"CLI Error: {e}", "FAILURE")
             return -1, ""
@@ -1628,7 +1747,8 @@ class App(ctk.CTk):
     def build_header(self, parent):
         h = frame(parent)
         h.grid(row=0, column=0, sticky="ew")
-        n = 5
+        show_debug = debug_ui_enabled()
+        n = 6 if show_debug else 5
         h.grid_columnconfigure(gcol(0, n), weight=1)
         left = frame(h)
         left.grid(row=0, column=gcol(0, n), sticky=a_start())
@@ -1647,24 +1767,44 @@ class App(ctk.CTk):
 
         def width_for(*keys, minimum=108, font=sans(12)):
             return max([minimum] + [self.text_width(t(k), font) + 36 for k in keys])
+        col = 2
+
+        if show_debug:
+            self.sw_debug = ctk.CTkSwitch(
+                h,
+                text=t("debug_cli"),
+                command=self.on_debug_cli,
+                width=46,
+                font=sans(12),
+                progress_color=ACCENT,
+                fg_color=BORDER,
+                text_color=TEXT_2
+            )
+            self.sw_debug.grid(
+                row=0, column=gcol(col, n), padx=pads(8, 0)
+            )
+            Tooltip(self.sw_debug, t("debug_cli_tip"))
+            col += 1
 
         self.btn_export = ghost_button(h, t("export_csv"), self.export_csv, width=width_for("export_csv"),
                                        height=40, corner_radius=9)
-        self.btn_export.grid(row=0, column=gcol(2, n), padx=pads(10, 0))
+        self.btn_export.grid(row=0, column=gcol(col, n), padx=pads(10, 0))
+        col += 1
         Tooltip(self.btn_export, t("export_tip"))
         self.btn_disconnect = ghost_button(h, t("disconnect"), self.disconnect_vpn, width=width_for("disconnect"),
                                            height=40, corner_radius=9)
-        self.btn_disconnect.grid(row=0, column=gcol(3, n), padx=pads(8, 0))
+        self.btn_disconnect.grid(row=0, column=gcol(col, n), padx=pads(8, 0))
+        col += 1
         Tooltip(self.btn_disconnect, t("disconnect_tip"))
         main_width = max(176, self.text_width(t("start_n", n="0,000"), sans(13, True)) + 40)
         self.btn_start = primary_button(h, t("start"), self.start_job, width=main_width, height=40)
-        self.btn_start.grid(row=0, column=gcol(4, n), padx=pads(8, 0))
+        self.btn_start.grid(row=0, column=gcol(col, n), padx=pads(8, 0))
         Tooltip(self.btn_start, t("start_tip"))
         self.btn_stop = ctk.CTkButton(h, text=t("stop"), command=self.stop_job, width=main_width, height=40,
                                       corner_radius=9, fg_color=BAD_SOFT, hover_color=BAD_HOVER, border_width=1,
                                       border_color=BAD_LINE, text_color=BAD_TEXT, text_color_disabled="#8A5A5A",
                                       font=sans(13, True))
-        self.btn_stop.grid(row=0, column=gcol(4, n), padx=pads(8, 0))
+        self.btn_stop.grid(row=0, column=gcol(col, n), padx=pads(8, 0))
         self.btn_stop.grid_remove()
 
     def build_live_card(self, parent):
@@ -2559,6 +2699,8 @@ class App(ctk.CTk):
         self.btn_timing.configure(text=f"{arrow}   {summary}")
 
     # ---------------- CLI ----------------
+    def on_debug_cli(self):
+        set_debug_cli(bool(self.sw_debug.get()))
     def refresh_cli_status(self):
         path = resolve_cli(self.entry_cli.get())
         if path:

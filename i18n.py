@@ -207,6 +207,16 @@ STRINGS = {
                          "fa": "مکث بین اتصال و پینگ (0 تا 60 ثانیه).",
                          "ru": "Пауза между подключением и пингом (0–60 с)."},
     "windscribe_cli": {"en": "Windscribe CLI", "fa": "Windscribe CLI", "ru": "Windscribe CLI"},
+    "debug_cli": {
+        "en": "Debug",
+        "fa": "Debug",
+        "ru": "Debug"
+    },
+    "debug_cli_tip": {
+        "en": "Run CLI commands in a visible window. Off for normal use.",
+        "fa": "Run CLI commands in a visible window. Off for normal use.",
+        "ru": "Run CLI commands in a visible window. Off for normal use."
+    },
     "cli_ready": {"en": "Windscribe CLI ready", "fa": "Windscribe CLI آماده است", "ru": "Windscribe CLI готов"},
     "cli_missing": {"en": "Windscribe CLI not found · set path", "fa": "Windscribe CLI پیدا نشد · مسیر را تعیین کنید",
                     "ru": "Windscribe CLI не найден · укажите путь"},
