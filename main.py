@@ -811,6 +811,7 @@ class WindscribeWorker:
                     break
 
                 ping_avg = loss = None
+                carried = False
                 status_str = "FAILURE"
                 if connected:
                     self.phase(self.CONNECT, "done", duration)
