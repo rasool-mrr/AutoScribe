@@ -571,6 +571,36 @@ class WindscribeWorker:
         up = out.upper()
         return "CONNECTED" in up and "DISCONNECTED" not in up and "CONNECTING" not in up
 
+    def wait_for_connection(self, start_time, timeout, stable_reads=3):
+        """Windscribe reports 'Connected' while the tunnel is still flapping, so one reading is not
+        proof: the same verdict has to hold for `stable_reads` consecutive polls."""
+        seen = 0
+        while time.time() - start_time < timeout:
+            _, out = self.run_cli(["status"])
+            seen = seen + 1 if self.is_connected_output(out) else 0
+            if seen >= stable_reads:
+                return True, time.time() - start_time
+            if self.stop_event.wait(1):
+                return False, 0.0
+        return False, 0.0
+
+    def tunnel_carries_traffic(self, ping_host, ping_count):
+        """The only honest proof of a connection: a reply that comes back while the tunnel is up.
+
+        Status text alone is not enough - Windscribe shows 'Connected' while the WireGuard handshake
+        keeps dying - and a ping alone is not enough either, because as soon as the tunnel drops its
+        routes the ping silently goes out over the physical link and succeeds. So the status has to
+        read connected both before and after the ping.
+        """
+        if not self.is_connected_output(self.run_cli(["status"])[1]):
+            return False, None, "not connected before the ping"
+        result, err = self.pinger.run(ping_host, ping_count)
+        if not self.is_connected_output(self.run_cli(["status"])[1]):
+            return False, result, "the connection dropped during the ping"
+        if result:
+            return True, result, None
+        return False, None, err
+
     def ensure_disconnected(self):
         for _ in range(5):
             _, out = self.run_cli(["status"])
@@ -582,15 +612,6 @@ class WindscribeWorker:
                 break
         _, out = self.run_cli(["status"])
         return "DISCONNECTED" in out.upper()
-
-    def wait_for_connection(self, start_time, timeout):
-        while time.time() - start_time < timeout:
-            _, out = self.run_cli(["status"])
-            if self.is_connected_output(out):
-                return True, time.time() - start_time
-            if self.stop_event.wait(1):
-                return False, 0.0
-        return False, 0.0
 
     # -- job control --
     def start(self, work_plan, opts):
@@ -629,6 +650,13 @@ class WindscribeWorker:
             start_ts = time.time()
             self.run_cli(["connect", "-n", r["city"], route], timeout=timeout + 15)
             connected, duration = self.wait_for_connection(start_ts, timeout)
+            if connected:
+                # Same rule as the batch runner: status text is not proof, a reply through the tunnel is.
+                carried, _res, _err = self.tunnel_carries_traffic("1.1.1.1", 3)
+                if not carried:
+                    connected = False
+                    self.phase(self.CONNECT, "fail")
+                    self.log(f"{r['city']} via {route} reports connected but carries no traffic", "FAILURE")
             if connected:
                 self.phase(self.CONNECT, "done", duration)
                 self.log(f"Connected to {r['city']} via {route} in {duration:.1f}s", "SUCCESS")
@@ -724,8 +752,6 @@ class WindscribeWorker:
                 ping_avg = loss = None
                 status_str = "FAILURE"
                 if connected:
-                    status_str = "SUCCESS"
-                    ok += 1
                     self.phase(self.CONNECT, "done", duration)
                     self.log(f"Connected in {duration:.2f}s", "SUCCESS")
 
@@ -738,8 +764,8 @@ class WindscribeWorker:
 
                     self.phase(self.PING, "active")
                     t0 = time.time()
-                    result, err = self.pinger.run(opts["ping_host"], opts["ping_count"])
-                    self.phase(self.PING, "done" if result else "fail", time.time() - t0)
+                    carried, result, err = self.tunnel_carries_traffic(opts["ping_host"], opts["ping_count"])
+                    self.phase(self.PING, "done" if carried else "fail", time.time() - t0)
                     self.app.post(self.app.set_ping, result)
                     if result:
                         ping_avg, loss = result["avg"], result["loss"]
@@ -747,6 +773,15 @@ class WindscribeWorker:
                                  f"loss {loss:.0f}%", "INFO")
                     else:
                         self.log(f"Ping failed: {err}", "WARN")
+
+                    # "Connected" with no packet coming back is the flapping case: Windscribe shows the
+                    # tunnel up while the handshake keeps dying. Only a real reply counts as a working route.
+                    if carried:
+                        status_str = "SUCCESS"
+                        ok += 1
+                    else:
+                        fail += 1
+                        self.log("Tunnel carried no traffic; counted as failed, not connected.", "FAILURE")
                 else:
                     fail += 1
                     self.phase(self.CONNECT, "fail", opts["timeout"])
