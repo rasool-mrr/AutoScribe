@@ -230,6 +230,20 @@ def cli_server_name(city, node):
     return f"{city} - {node}" if node else city
 
 
+def is_different_server(actual, expected):
+    """True only when the CLI explicitly names a server other than the one that was requested.
+
+    A missing or city-only name proves nothing (some entries answer with just the city), so it is
+    never treated as a mismatch; only a fully qualified 'City - Nickname' that differs is.
+    """
+    if not actual or not expected:
+        return False
+    a, e = actual.strip().lower(), expected.strip().lower()
+    if a == e:
+        return False
+    return " - " in a
+
+
 def matches_region(loc, region):
     if region == "All":
         return True
@@ -584,7 +598,14 @@ class WindscribeWorker:
     @staticmethod
     def is_connected_output(out):
         up = out.upper()
-        return "CONNECTED" in up and "DISCONNECTED" not in up and "CONNECTING" not in up
+        if "DISCONNECTED" in up or "CONNECTING" in up:
+            return False
+        # The CLI can append these to a "Connected to ..." line while the tunnel is not usable:
+        # "(checking the connection)" means the check has not finished, "(network interference
+        # detected)" means the check failed. Neither is a working connection.
+        if "CHECKING THE CONNECTION" in up or "NETWORK INTERFERENCE" in up:
+            return False
+        return "CONNECTED" in up
 
     @staticmethod
     def connected_server(out):
@@ -629,7 +650,7 @@ class WindscribeWorker:
             return False, None, "not connected before the ping"
         if expected:
             actual = self.connected_server(before)
-            if actual and actual.lower() != expected.lower():
+            if is_different_server(actual, expected):
                 return False, None, f"connected to {actual} instead of {expected}"
         result, err = self.pinger.run(ping_host, ping_count)
         if not self.is_connected_output(self.run_cli(["status"])[1]):
@@ -822,7 +843,7 @@ class WindscribeWorker:
                         ok += 1
                     else:
                         fail += 1
-                        self.log("Tunnel carried no traffic; counted as failed, not connected.", "FAILURE")
+                        self.log(f"Tunnel carried no traffic: {err}", "FAILURE")
                 else:
                     fail += 1
                     self.phase(self.CONNECT, "fail", opts["timeout"])
@@ -833,7 +854,7 @@ class WindscribeWorker:
                 self.app.post(self.app.add_result_row, city, node, country, proto, port, status_str,
                               duration, ping_avg, loss)
 
-                if connected and opts["stop_on_success"]:
+                if carried and opts["stop_on_success"]:
                     kept_connection = f"{loc_name(city, node)} · {route}"
                     self.log(f"Stop on success: staying connected to {kept_connection}.", "SUCCESS")
                     break
