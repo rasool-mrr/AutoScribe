@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Created next to main.py when you run the app from source: personal settings, profiles and results
+config.json
+config.json.bak
+config.json.tmp
+windscribe_results.db
+reports/
+
+# PyInstaller
+build/
+dist/
+*.spec
