@@ -1,4 +1,7 @@
+import locale
 import re
+import sys
+import types
 
 import pytest
 
@@ -25,6 +28,14 @@ def test_placeholders_match_across_languages():
     for key, entry in i18n.STRINGS.items():
         for lang in ("fa", "ru"):
             assert placeholders(entry[lang]) == placeholders(entry["en"]), f"{key} [{lang}]"
+
+
+@pytest.mark.parametrize("locale_name, expected", [("fa_IR", "fa"), ("ru_RU", "ru"), ("en_US", "en"),
+                                                   ("de_DE", "en"), (None, "en")])
+def test_detect_language_follows_the_system_locale_off_windows(monkeypatch, locale_name, expected):
+    monkeypatch.setitem(sys.modules, "ctypes", types.SimpleNamespace())  # no windll, as on Linux and macOS
+    monkeypatch.setattr(locale, "getlocale", lambda *a, **k: (locale_name, "UTF-8"))
+    assert i18n.detect_language() == expected
 
 
 def test_unknown_language_falls_back_to_english():

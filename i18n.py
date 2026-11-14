@@ -14,13 +14,19 @@ def set_language(lang):
 
 
 def detect_language():
-    """Picks the UI language from the Windows display language on first launch."""
+    """Picks the UI language on first launch: the Windows display language, or the system locale elsewhere."""
     try:
         import ctypes
         primary = ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3FF
         return {0x29: "fa", 0x19: "ru"}.get(primary, "en")
     except Exception:
+        pass  # not Windows
+    try:
+        import locale
+        code = (locale.getlocale()[0] or "").split("_")[0].lower()
+    except Exception:
         return "en"
+    return code if code in LANGUAGES else "en"
 
 
 def t(key, **kw):
