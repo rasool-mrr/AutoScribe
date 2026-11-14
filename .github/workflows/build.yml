@@ -57,7 +57,6 @@ jobs:
         shell: bash
         run: |
           cd dist
-          python -c "import os, platform; print(platform.system())"
           if [ "$RUNNER_OS" = "Windows" ]; then
             7z a "../AutoScribe-${{ matrix.platform }}.zip" AutoScribe.exe locations.json
           else
