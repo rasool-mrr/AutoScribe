@@ -42,7 +42,7 @@ AutoScribe — это настольное приложение, которое 
 ## Установка
 
 ```bash
-git clone https://github.com/<your-username>/AutoScribe.git
+git clone https://github.com/rasool-mrr/AutoScribe.git
 cd AutoScribe
 python -m venv .venv
 .venv\Scripts\activate          # Linux/macOS: source .venv/bin/activate
@@ -90,6 +90,7 @@ python main.py
 | `config.json` | Ваши настройки и профили (создаётся автоматически) |
 | `windscribe_results.db` | База результатов SQLite (создаётся автоматически) |
 | `reports/` | Экспортированные CSV-файлы |
+| `tests/` | Автоматические тесты, запуск: `python -m pytest` |
 
 ## Сборка .exe
 
@@ -103,6 +104,17 @@ pyinstaller --noconsole --onefile --name AutoScribe --collect-data customtkinter
 ## Участие в разработке
 
 Issues и pull requests приветствуются. Сделайте форк, внесите изменения и откройте PR.
+
+Чтобы поработать с кодом:
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest                                  # needs neither Tk nor a display
+ruff check --select E4,E7,E9,F --ignore E741 .    # the same lint CI runs
+```
+
+Переводы находятся в `i18n.py`. У каждой строки должны быть значения `en`, `fa` и `ru`, а `{подстановки}` должны
+совпадать во всех трёх (это проверяет тест).
 
 ## Лицензия
 

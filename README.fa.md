@@ -47,7 +47,7 @@ AutoScribe یک برنامهٔ دسکتاپ است که **Windscribe CLI** رس�
 </div>
 
 ```bash
-git clone https://github.com/<your-username>/AutoScribe.git
+git clone https://github.com/rasool-mrr/AutoScribe.git
 cd AutoScribe
 python -m venv .venv
 .venv\Scripts\activate          # Linux/macOS: source .venv/bin/activate
@@ -97,6 +97,7 @@ python main.py
 | `config.json` | تنظیمات و پروفایل‌های شما (خودکار ساخته می‌شود) |
 | `windscribe_results.db` | پایگاه دادهٔ SQLite نتایج (خودکار ساخته می‌شود) |
 | `reports/` | فایل‌های CSV خروجی |
+| `tests/` | تست‌های خودکار (اجرا با `python -m pytest`) |
 
 ## ساخت فایل اجرایی (.exe)
 
@@ -114,6 +115,20 @@ pyinstaller --noconsole --onefile --name AutoScribe --collect-data customtkinter
 ## مشارکت
 
 گزارش مشکل (Issue) و Pull Request پذیرفته می‌شود. مخزن را Fork کنید، تغییرتان را اعمال کنید و یک PR بفرستید.
+
+برای کار روی کد:
+
+</div>
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest                                  # needs neither Tk nor a display
+ruff check --select E4,E7,E9,F --ignore E741 .    # the same lint CI runs
+```
+
+<div dir="rtl">
+
+ترجمه‌ها در `i18n.py` هستند. هر رشته باید سه مقدار `en`، `fa` و `ru` داشته باشد و متغیرهای داخل آکولاد (مثل `{n}`) باید در هر سه زبان یکسان باشند (یک تست این را بررسی می‌کند).
 
 ## مجوز
 
