@@ -256,24 +256,40 @@ class ConfigManager:
         if not os.path.exists(CONFIG_FILE):
             return default_data
         try:
-            with open(CONFIG_FILE, "r") as f:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
             for key, val in default_data.items():
                 loaded.setdefault(key, val)
             for key, val in default_data["last_settings"].items():
                 loaded["last_settings"].setdefault(key, val)
             return loaded
-        except Exception as e:
+        except OSError as e:
             print(f"Config Load Error: {e}")
+            return default_data
+        except Exception as e:
+            # Damaged or unexpected content. The next save would overwrite it with defaults and lose the
+            # saved profiles, so move it aside where it can still be recovered by hand.
+            print(f"Config Load Error: {e}")
+            try:
+                os.replace(CONFIG_FILE, CONFIG_FILE + ".bak")
+            except OSError as backup_error:
+                print(f"Config Backup Error: {backup_error}")
             return default_data
 
     @staticmethod
     def save_config(data):
+        """Writes to a temporary file first, so a crash or a full disk can't leave a half-written config.json."""
+        tmp = CONFIG_FILE + ".tmp"
         try:
-            with open(CONFIG_FILE, "w") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4)
+            os.replace(tmp, CONFIG_FILE)
         except Exception as e:
             print(f"Config Save Error: {e}")
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
