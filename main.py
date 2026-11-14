@@ -174,6 +174,22 @@ def open_path(path):
         print(f"Open Error: {e}")
 
 
+def ping_command(host, count, reply_timeout_ms, system=None):
+    """Command line for the system ping. The flag for the reply timeout differs by platform:
+    Windows -w and macOS/BSD -W take milliseconds, Linux -W takes whole seconds."""
+    system = system or platform.system()
+    if system == "Windows":
+        return ["ping", "-n", str(count), "-w", str(reply_timeout_ms), host]
+    if system == "Darwin":
+        return ["ping", "-c", str(count), "-W", str(reply_timeout_ms), host]
+    return ["ping", "-c", str(count), "-W", str(max(1, reply_timeout_ms // 1000)), host]
+
+
+def valid_ping_host(host):
+    """False for an empty host, one with whitespace in it, or one that ping would read as an option."""
+    return bool(host) and not host.startswith("-") and not any(c.isspace() for c in host)
+
+
 def ping_color(ping):
     if ping is None:
         return MUTED
@@ -332,7 +348,12 @@ class LocationManager:
 # Ping - uses the system `ping`, nothing else to install
 # ---------------------------------------------------------------------------
 class PingRunner:
-    TIME_RE = re.compile(r"[=<]\s*(\d+(?:[.,]\d+)?)\s*ms", re.IGNORECASE)
+    # Latency of a reply: "time=12.3 ms" on Linux, macOS and English Windows ("time<1ms" for very fast replies).
+    TIME_RE = re.compile(r"\btime\s*[=<]\s*(\d+(?:[.,]\d+)?)", re.IGNORECASE)
+    # Windows translates the whole line ("время=20мс", "Zeit=18ms") and prints it in the console's OEM code page,
+    # which arrives here as replacement characters, so the word "time" can't be matched. The latency is always
+    # the number just before "TTL=", whatever the language.
+    BEFORE_TTL_RE = re.compile(r"[=<]\s*(\d+(?:[.,]\d+)?)[^\d=<]*?\bttl\s*=", re.IGNORECASE)
 
     @staticmethod
     def parse(output):
@@ -342,17 +363,16 @@ class PingRunner:
         for line in output.splitlines():
             if "ttl" not in line.lower():
                 continue
-            m = PingRunner.TIME_RE.search(line)
+            m = PingRunner.TIME_RE.search(line) or PingRunner.BEFORE_TTL_RE.search(line)
             if m:
                 times.append(float(m.group(1).replace(",", ".")))
         return times
 
     def run(self, host, count=5, reply_timeout_ms=2000):
         """Returns ({"avg", "min", "max", "loss"}, None) or (None, error)."""
-        if IS_WINDOWS:
-            cmd = ["ping", "-n", str(count), "-w", str(reply_timeout_ms), host]
-        else:
-            cmd = ["ping", "-c", str(count), "-W", str(max(1, reply_timeout_ms // 1000)), host]
+        if not valid_ping_host(host):
+            return None, "invalid ping host"
+        cmd = ping_command(host, count, reply_timeout_ms)
         try:
             result = subprocess.run(
                 cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -371,7 +391,7 @@ class PingRunner:
             "avg": sum(times) / len(times),
             "min": min(times),
             "max": max(times),
-            "loss": (count - len(times)) / count * 100,
+            "loss": max(0.0, (count - len(times)) / count * 100),  # duplicate replies (DUP!) can exceed count
         }, None
 
 
@@ -2796,7 +2816,7 @@ class App(ctk.CTk):
         if ping_count is None:
             return
         host = self.entry_ping_host.get().strip()
-        if not host or " " in host:
+        if not valid_ping_host(host):
             self.flag_invalid(self.entry_ping_host, t("bad_host"))
             return
 
