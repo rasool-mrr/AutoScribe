@@ -60,8 +60,8 @@ class FakeResponse:
     def __init__(self, payload):
         self.payload = payload
 
-    def read(self):
-        return self.payload
+    def read(self, size=-1):
+        return self.payload if size < 0 else self.payload[:size]
 
     def __enter__(self):
         return self
@@ -76,6 +76,16 @@ def test_download_rejects_empty_lists_and_keeps_old_file(locations_file, monkeyp
     locations_file.write_text(json.dumps(SAMPLE), encoding="utf-8")
     monkeypatch.setattr(main.urllib.request, "urlopen", lambda req, timeout=0: FakeResponse(payload))
     with pytest.raises(ValueError):
+        main.LocationManager.download()
+    assert json.loads(locations_file.read_text(encoding="utf-8")) == SAMPLE
+
+
+def test_download_rejects_an_oversized_response(locations_file, monkeypatch):
+    locations_file.write_text(json.dumps(SAMPLE), encoding="utf-8")
+    monkeypatch.setattr(main, "LOCATIONS_MAX_BYTES", 100)
+    monkeypatch.setattr(main.urllib.request, "urlopen",
+                        lambda req, timeout=0: FakeResponse(json.dumps(SAMPLE).encode("utf-8")))
+    with pytest.raises(ValueError, match="too large"):
         main.LocationManager.download()
     assert json.loads(locations_file.read_text(encoding="utf-8")) == SAMPLE
 

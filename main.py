@@ -113,6 +113,7 @@ REPORTS_DIR = os.path.join(APP_PATH, "reports")
 DEFAULT_CLI = r"C:\Program Files\Windscribe\windscribe-cli.exe" if IS_WINDOWS else "windscribe-cli"
 # The public server list that windscribe.com/vpn-servers loads; same format as locations.json.
 LOCATIONS_URL = "https://api.windscribe.com/WebsiteStatus"
+LOCATIONS_MAX_BYTES = 10 * 1024 * 1024  # a real list is around 1 MB; anything far larger is not a server list
 
 def init_fonts(root):
     global SANS, MONO, ICON_FONT
@@ -340,7 +341,9 @@ class LocationManager:
             # The same placeholder token windscribe.com's own server list page sends.
             "Authorization": "Bearer 1234"})
         with urllib.request.urlopen(req, timeout=20) as resp:
-            raw = resp.read()
+            raw = resp.read(LOCATIONS_MAX_BYTES + 1)
+        if len(raw) > LOCATIONS_MAX_BYTES:
+            raise ValueError("the response is too large to be a server list")
         data = json.loads(raw.decode("utf-8"))
         locations = data.get("data", {}).get("locations")
         if not isinstance(locations, dict) or not locations:
