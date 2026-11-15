@@ -95,6 +95,11 @@ PROTO_NAMES = {"wireguard": "WireGuard", "ikev2": "IKEv2", "udp": "UDP", "tcp": 
 # this point the client is broken in a way a restart does not fix and the queue should not spin.
 MAX_STUCK_RECOVERIES = 3
 
+# With the GUI process dead the CLI does not fail, it blocks - every call burns its full timeout. Two
+# such calls in a row is the same dead end as the Error-6 status text, so recovery treats them alike
+# instead of retrying until the user gives up.
+HUNG_TIMEOUT_STREAK = 2
+
 DEFAULT_PROTOCOLS = {
     "wireguard": [443, 80, 53, 123, 1194, 65142],
     "ikev2": [500],
@@ -591,6 +596,7 @@ class WindscribeWorker:
         self.stop_event = threading.Event()
         self.running = False
         self.cli_cmd = cli_cmd
+        self.consecutive_timeouts = 0
 
     # -- helpers (all UI access goes through app.post, never touches widgets directly) --
     def log(self, msg, tag="INFO"):
@@ -604,12 +610,24 @@ class WindscribeWorker:
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
                                     timeout=timeout, **hidden_process_kwargs())
+            self.consecutive_timeouts = 0
             return result.returncode, result.stdout
         except subprocess.TimeoutExpired:
+            self.consecutive_timeouts += 1
             return -1, ""
         except Exception as e:
+            self.consecutive_timeouts = 0
             self.log(f"CLI Error: {e}", "FAILURE")
             return -1, ""
+
+    def engine_is_hung(self):
+        """True when the CLI has stopped answering altogether.
+
+        A dead GUI makes windscribe-cli block rather than fail, so the only symptom is a run of
+        timeouts with no output. That is a dead end just like the Error-6 status text, and the same
+        restart clears it - but nothing else here would notice it.
+        """
+        return self.consecutive_timeouts >= HUNG_TIMEOUT_STREAK
 
     @staticmethod
     def is_connected_output(out):
@@ -789,7 +807,12 @@ class WindscribeWorker:
             # client into one restart per test. The batch loop owns that decision.
             if self.is_disconnected_output(out):
                 return True
+            if self.engine_is_hung():
+                # The CLI just burned a full timeout; more calls would only waste minutes.
+                return False
             self.run_cli(["firewall", "off"])
+            if self.engine_is_hung():
+                return False
             self.run_cli(["disconnect"])
             if self.stop_event.wait(3):
                 break
@@ -905,8 +928,17 @@ class WindscribeWorker:
                 t0 = time.time()
                 if not self.ensure_disconnected():
                     self.phase(self.DISCONNECT, "fail")
-                    self.log("Could not disconnect, skipping this test.", "FAILURE")
-                    continue
+                    recovered = False
+                    if self.engine_is_hung() and stuck_recoveries < MAX_STUCK_RECOVERIES:
+                        # Same dead end as the Error-6 text, same cure. This is the only other place
+                        # allowed to restart, so the cap still holds.
+                        stuck_recoveries += 1
+                        recovered = self.recover_engine()
+                        if recovered:
+                            self.log("Windscribe stopped answering; restarted it.", "WARN")
+                    if not recovered:
+                        self.log("Could not disconnect, skipping this test.", "FAILURE")
+                        continue
                 self.phase(self.DISCONNECT, "done", time.time() - t0)
                 if self.stop_event.is_set():
                     break
