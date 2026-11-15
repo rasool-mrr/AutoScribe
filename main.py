@@ -787,6 +787,42 @@ class WindscribeWorker:
         out = subprocess.run(["pgrep", "-f", "Windscribe"], capture_output=True, text=True).stdout
         return bool(out.strip())
 
+    def wait_until_accepts_connect(self, target, route, attempts=5, probe_seconds=6):
+        """True once a connect request actually takes effect after a restart.
+
+        "Disconnected" is NOT a readiness signal: the client answers that while it is still starting up
+        and still dropping the connect requests it receives. That produced a 25-second timeout recorded
+        as a route failure for a client that was healthy a moment later (the user connected by hand in
+        8.4 s).
+
+        So the probe sends a real connect and watches the status for a transition out of the
+        disconnected state. On success the connection is torn down - the caller is about to connect
+        anyway - and True is returned.
+        """
+        for _ in range(attempts):
+            if self.stop_event.is_set():
+                return False
+            self.run_cli(["connect", "-n", target, route], timeout=30)
+            deadline = self.now() + probe_seconds
+            while self.now() < deadline:
+                if self.stop_event.wait(1):
+                    return False
+                _, out = self.run_cli(["status"], timeout=10)
+                up = out.upper()
+                if "CONNECTING TO" in up or "CONNECTED TO" in up:
+                    self.run_cli(["disconnect"])
+                    return True
+                if self.stop_event.is_set() or self.stop_event.wait(1):
+                    return False
+            # Still nothing: the request was dropped. Let the client settle and try again.
+            self.stop_event.wait(2)
+        return False
+
+    @staticmethod
+    def now():
+        """Indirection so a test can drive the clock instead of sleeping through it."""
+        return time.time()
+
     def recover_engine(self, wait_seconds=60):
         """Restart Windscribe's GUI and wait for the CLI to answer normally again.
 
@@ -1028,8 +1064,20 @@ class WindscribeWorker:
                         stuck_recoveries += 1
                         restarted = self.recover_engine()
                     if restarted:
-                        self.log("Retrying this route after the restart.", "WARN")
                         self.phase(self.CONNECT, "active")
+                        # A restart that answers "Disconnected" is not ready: the client still drops
+                        # connect requests for a few seconds. Without this wait the route below burned
+                        # a full timeout and was recorded as a failure while the client was fine.
+                        if not self.wait_until_accepts_connect(target, route):
+                            self.log("Windscribe restarted but would not accept a connection; "
+                                     "recording this route and moving on.", "FAILURE")
+                            self.db.record_result(node, city, country, proto, port, "CLI_STUCK", 0,
+                                                  None, None, opts["profile_name"])
+                            self.app.post(self.app.add_result_row, city, node, country, proto, port,
+                                          "CLI_STUCK", 0, None, None)
+                            fail += 1
+                            continue
+                        self.log("Retrying this route after the restart.", "WARN")
                         start_ts = time.time()
                         self.run_cli(["connect", "-n", target, route], timeout=opts["timeout"] + 15)
                         self.stop_event.wait(1)

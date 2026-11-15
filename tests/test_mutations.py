@@ -133,6 +133,16 @@ class FakeStop:
         return self._set
 
 
+class _FastClock:
+    def __init__(self, step=1.0):
+        self.t = 0.0
+        self.step = step
+
+    def __call__(self):
+        self.t += self.step
+        return self.t
+
+
 STUCK = ("Login:       Logged in\n"
          "Connection:  Error: A required VPN process is not responding\n")
 
@@ -185,6 +195,12 @@ class StuckForever(main.WindscribeWorker):
         self.pinger = FakePinger(OK_PING)
         self.db = FakeDB()
         self.restarts = 0
+        # The readiness probe after a restart would otherwise sleep for real seconds per test.
+        self.now = _FastClock()
+        self.connect_accepted = True
+
+    def wait_until_accepts_connect(self, target, route, attempts=5, probe_seconds=6):
+        return self.connect_accepted
 
     def run_cli(self, args, timeout=30):
         if args and args[0] == "status":
