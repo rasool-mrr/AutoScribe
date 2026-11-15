@@ -149,7 +149,7 @@ def main_probe():
         if not worker.ensure_disconnected():
             print("could not disconnect; stopping", flush=True)
             break
-        start_ts = time.time()          # BEFORE connect: the wait must cover the connect call too
+        start_ts = worker.now()           # BEFORE connect: the wait must cover the connect call too
         worker.run_cli(["connect", "-n", args.server, route], timeout=args.timeout + 15)
         connected, _ = worker.wait_for_connection(start_ts, args.timeout)
         if not connected:

@@ -100,6 +100,11 @@ MAX_STUCK_RECOVERIES = 3
 # instead of retrying until the user gives up.
 HUNG_TIMEOUT_STREAK = 2
 
+# How long to wait before deciding Windscribe dropped a connect request instead of trying it. The
+# client shows "Connecting to <city>" within a second or two when it is really working on it; a modal
+# dialog (or a client still starting up) means the request is silently discarded.
+DROPPED_REQUEST_GRACE = 6
+
 DEFAULT_PROTOCOLS = {
     "wireguard": [443, 80, 53, 123, 1194, 65142],
     "ikev2": [500],
@@ -684,13 +689,26 @@ class WindscribeWorker:
         Consequence worth knowing: a connection that arrives less than ~stable_reads seconds before
         the timeout is rejected, and the recorded connect time includes those confirmation polls. Both
         are deliberate - a route that cannot hold for three seconds is not one to recommend.
+
+        A request that Windscribe never picked up is detected early: when the status never shows
+        "Connecting to", the client dropped the request (a modal is open, or it is still starting up)
+        and waiting out the full timeout records a failure that says nothing about the route.
+
+        `start_time` must come from self.now(), the same clock this method reads.
         """
         seen = 0
-        while time.time() - start_time < timeout:
+        picked_up = False
+        give_up_at = start_time + min(timeout, DROPPED_REQUEST_GRACE)
+        while self.now() - start_time < timeout:
             _, out = self.run_cli(["status"])
+            up = out.upper()
+            if "CONNECTING TO" in up or "CONNECTED TO" in up:
+                picked_up = True
             seen = seen + 1 if self.is_connected_output(out) else 0
             if seen >= stable_reads:
-                return True, time.time() - start_time
+                return True, self.now() - start_time
+            if not picked_up and self.now() >= give_up_at:
+                return False, 0.0          # the request went nowhere; do not burn the timeout
             if self.stop_event.wait(1):
                 return False, 0.0
         return False, 0.0
@@ -932,7 +950,7 @@ class WindscribeWorker:
                 return
             self.phase(self.DISCONNECT, "done", time.time() - t0)
             self.phase(self.CONNECT, "active")
-            start_ts = time.time()
+            start_ts = self.now()
             result_loc = {"city": r["city"], "location": r.get("node", ""), "country": r.get("country", "")}
             self.run_cli(["connect", "-n", connect_target(result_loc), route], timeout=timeout + 15)
             connected, duration = self.wait_for_connection(start_ts, timeout)
@@ -1034,7 +1052,7 @@ class WindscribeWorker:
                     break
 
                 self.phase(self.CONNECT, "active")
-                start_ts = time.time()
+                start_ts = self.now()
                 target = connect_target(loc)
                 self.run_cli(["connect", "-n", target, route], timeout=opts["timeout"] + 15)
                 self.stop_event.wait(1)
@@ -1078,7 +1096,7 @@ class WindscribeWorker:
                             fail += 1
                             continue
                         self.log("Retrying this route after the restart.", "WARN")
-                        start_ts = time.time()
+                        start_ts = self.now()
                         self.run_cli(["connect", "-n", target, route], timeout=opts["timeout"] + 15)
                         self.stop_event.wait(1)
                         connected, duration = self.wait_for_connection(start_ts, opts["timeout"])
