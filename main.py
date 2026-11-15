@@ -211,8 +211,37 @@ def loc_key(loc):
     return f"{loc['country']}|{loc['city']}|{loc['location']}"
 
 
+def connect_target(loc):
+    """The nickname is the only value that picks ONE datacenter.
+
+    `windscribe-cli connect <city>` picks a random datacenter in that city, so a run on
+    "Melbourne - Yarra" would silently also test "Melbourne - Port Phillip". Nicknames are
+    unique in the server list, so passing the nickname pins the exact server the user selected.
+    """
+    return loc["location"] or loc["city"]
+
+
 def loc_name(city, node):
     return f"{city} – {node}" if node else city
+
+
+def cli_server_name(city, node):
+    """How `windscribe-cli status` spells a server: ASCII ' - ', not the en dash used in the UI."""
+    return f"{city} - {node}" if node else city
+
+
+def is_different_server(actual, expected):
+    """True only when the CLI explicitly names a server other than the one that was requested.
+
+    A missing or city-only name proves nothing (some entries answer with just the city), so it is
+    never treated as a mismatch; only a fully qualified 'City - Nickname' that differs is.
+    """
+    if not actual or not expected:
+        return False
+    a, e = actual.strip().lower(), expected.strip().lower()
+    if a == e:
+        return False
+    return " - " in a
 
 
 def matches_region(loc, region):
@@ -569,7 +598,66 @@ class WindscribeWorker:
     @staticmethod
     def is_connected_output(out):
         up = out.upper()
-        return "CONNECTED" in up and "DISCONNECTED" not in up and "CONNECTING" not in up
+        if "DISCONNECTED" in up or "CONNECTING" in up:
+            return False
+        # The CLI can append these to a "Connected to ..." line while the tunnel is not usable:
+        # "(checking the connection)" means the check has not finished, "(network interference
+        # detected)" means the check failed. Neither is a working connection.
+        if "CHECKING THE CONNECTION" in up or "NETWORK INTERFERENCE" in up:
+            return False
+        return "CONNECTED" in up
+
+    @staticmethod
+    def connected_server(out):
+        """The server Windscribe actually connected to, e.g. 'Melbourne - Yarra'; '' if unknown."""
+        for line in out.splitlines():
+            if line.strip().lower().startswith("connection:"):
+                value = line.split(":", 1)[1].strip()
+                if not value.lower().startswith("connected to "):
+                    return ""
+                name = value[len("Connected to "):]
+                for suffix in (" (checking the connection)", " (network interference detected)"):
+                    name = name.replace(suffix, "")
+                return name.strip()
+        return ""
+
+    def wait_for_connection(self, start_time, timeout, stable_reads=3):
+        """Windscribe reports 'Connected' while the tunnel is still flapping, so one reading is not
+        proof: the same verdict has to hold for `stable_reads` consecutive polls."""
+        seen = 0
+        while time.time() - start_time < timeout:
+            _, out = self.run_cli(["status"])
+            seen = seen + 1 if self.is_connected_output(out) else 0
+            if seen >= stable_reads:
+                return True, time.time() - start_time
+            if self.stop_event.wait(1):
+                return False, 0.0
+        return False, 0.0
+
+    def tunnel_carries_traffic(self, ping_host, ping_count, expected=None):
+        """The only honest proof of a connection: a reply that comes back while the tunnel is up.
+
+        Status text alone is not enough - Windscribe shows 'Connected' while the WireGuard handshake
+        keeps dying - and a ping alone is not enough either, because as soon as the tunnel drops its
+        routes the ping silently goes out over the physical link and succeeds. So the status has to
+        read connected both before and after the ping.
+
+        `expected` is the 'City - Nickname' the caller asked for. When Windscribe lands on a different
+        server the test does not describe the route the user picked, so it is not a success either.
+        """
+        before = self.run_cli(["status"])[1]
+        if not self.is_connected_output(before):
+            return False, None, "not connected before the ping"
+        if expected:
+            actual = self.connected_server(before)
+            if is_different_server(actual, expected):
+                return False, None, f"connected to {actual} instead of {expected}"
+        result, err = self.pinger.run(ping_host, ping_count)
+        if not self.is_connected_output(self.run_cli(["status"])[1]):
+            return False, result, "the connection dropped during the ping"
+        if result:
+            return True, result, None
+        return False, None, err
 
     def ensure_disconnected(self):
         for _ in range(5):
@@ -582,15 +670,6 @@ class WindscribeWorker:
                 break
         _, out = self.run_cli(["status"])
         return "DISCONNECTED" in out.upper()
-
-    def wait_for_connection(self, start_time, timeout):
-        while time.time() - start_time < timeout:
-            _, out = self.run_cli(["status"])
-            if self.is_connected_output(out):
-                return True, time.time() - start_time
-            if self.stop_event.wait(1):
-                return False, 0.0
-        return False, 0.0
 
     # -- job control --
     def start(self, work_plan, opts):
@@ -627,8 +706,17 @@ class WindscribeWorker:
             self.phase(self.DISCONNECT, "done", time.time() - t0)
             self.phase(self.CONNECT, "active")
             start_ts = time.time()
-            self.run_cli(["connect", "-n", r["city"], route], timeout=timeout + 15)
+            result_loc = {"city": r["city"], "location": r.get("node", ""), "country": r.get("country", "")}
+            self.run_cli(["connect", "-n", connect_target(result_loc), route], timeout=timeout + 15)
             connected, duration = self.wait_for_connection(start_ts, timeout)
+            expected = cli_server_name(r["city"], r.get("node", ""))
+            if connected:
+                # Same rule as the batch runner: status text is not proof, a reply through the tunnel is.
+                carried, _res, _err = self.tunnel_carries_traffic("1.1.1.1", 3, expected=expected)
+                if not carried:
+                    connected = False
+                    self.phase(self.CONNECT, "fail")
+                    self.log(f"{r['city']} via {route} reports connected but carries no traffic", "FAILURE")
             if connected:
                 self.phase(self.CONNECT, "done", duration)
                 self.log(f"Connected to {r['city']} via {route} in {duration:.1f}s", "SUCCESS")
@@ -699,7 +787,8 @@ class WindscribeWorker:
 
                 self.phase(self.CONNECT, "active")
                 start_ts = time.time()
-                self.run_cli(["connect", "-n", city, route], timeout=opts["timeout"] + 15)
+                target = connect_target(loc)
+                self.run_cli(["connect", "-n", target, route], timeout=opts["timeout"] + 15)
                 self.stop_event.wait(1)
 
                 _, status_out = self.run_cli(["status"])
@@ -722,10 +811,9 @@ class WindscribeWorker:
                     break
 
                 ping_avg = loss = None
+                carried = False
                 status_str = "FAILURE"
                 if connected:
-                    status_str = "SUCCESS"
-                    ok += 1
                     self.phase(self.CONNECT, "done", duration)
                     self.log(f"Connected in {duration:.2f}s", "SUCCESS")
 
@@ -738,8 +826,9 @@ class WindscribeWorker:
 
                     self.phase(self.PING, "active")
                     t0 = time.time()
-                    result, err = self.pinger.run(opts["ping_host"], opts["ping_count"])
-                    self.phase(self.PING, "done" if result else "fail", time.time() - t0)
+                    carried, result, err = self.tunnel_carries_traffic(opts["ping_host"], opts["ping_count"],
+                                                                       expected=cli_server_name(city, node))
+                    self.phase(self.PING, "done" if carried else "fail", time.time() - t0)
                     self.app.post(self.app.set_ping, result)
                     if result:
                         ping_avg, loss = result["avg"], result["loss"]
@@ -747,6 +836,15 @@ class WindscribeWorker:
                                  f"loss {loss:.0f}%", "INFO")
                     else:
                         self.log(f"Ping failed: {err}", "WARN")
+
+                    # "Connected" with no packet coming back is the flapping case: Windscribe shows the
+                    # tunnel up while the handshake keeps dying. Only a real reply counts as a working route.
+                    if carried:
+                        status_str = "SUCCESS"
+                        ok += 1
+                    else:
+                        fail += 1
+                        self.log(f"Tunnel carried no traffic: {err}", "FAILURE")
                 else:
                     fail += 1
                     self.phase(self.CONNECT, "fail", opts["timeout"])
@@ -757,7 +855,7 @@ class WindscribeWorker:
                 self.app.post(self.app.add_result_row, city, node, country, proto, port, status_str,
                               duration, ping_avg, loss)
 
-                if connected and opts["stop_on_success"]:
+                if carried and opts["stop_on_success"]:
                     kept_connection = f"{loc_name(city, node)} · {route}"
                     self.log(f"Stop on success: staying connected to {kept_connection}.", "SUCCESS")
                     break
