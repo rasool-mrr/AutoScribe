@@ -42,7 +42,7 @@ throttled and you'd otherwise have to try routes by hand.
 ## Installation
 
 ```bash
-git clone https://github.com/<your-username>/AutoScribe.git
+git clone https://github.com/rasool-mrr/AutoScribe.git
 cd AutoScribe
 python -m venv .venv
 .venv\Scripts\activate          # Linux/macOS: source .venv/bin/activate
@@ -90,6 +90,7 @@ python main.py
 | `config.json` | Your settings and profiles (created automatically) |
 | `windscribe_results.db` | SQLite database of results (created automatically) |
 | `reports/` | Exported CSV files |
+| `tests/` | Automated tests, run with `python -m pytest` |
 
 ## Building a standalone .exe
 
@@ -103,6 +104,17 @@ Put `locations.json` in the same folder as `dist\AutoScribe.exe`.
 ## Contributing
 
 Issues and pull requests are welcome. Fork the repository, make your change, and open a PR.
+
+To work on the code:
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest                                  # needs neither Tk nor a display
+ruff check --select E4,E7,E9,F --ignore E741 .    # the same lint CI runs
+```
+
+Translations live in `i18n.py`. Every string needs an `en`, `fa` and `ru` entry, and the `{placeholders}` must be the
+same in all three (a test checks this).
 
 ## License
 
