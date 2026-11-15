@@ -1,0 +1,6 @@
+# Keep the server list byte-for-byte as Windscribe ships it.
+#
+# locations.json is 5,690 lines of JSON that the app never edits in the repository - it only rewrites
+# it at runtime. Without this, Git's autocrlf normalisation rewrites the whole file on checkout, which
+# produced two commits whose entire diff was that churn and made them look 5,690 lines long.
+locations.json -text

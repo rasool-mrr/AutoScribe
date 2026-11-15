@@ -42,7 +42,7 @@ throttled and you'd otherwise have to try routes by hand.
 ## Installation
 
 ```bash
-git clone https://github.com/<your-username>/AutoScribe.git
+git clone https://github.com/rasool-mrr/AutoScribe.git
 cd AutoScribe
 python -m venv .venv
 .venv\Scripts\activate          # Linux/macOS: source .venv/bin/activate
@@ -80,6 +80,21 @@ python main.py
 | Connect timeout | How long to wait for a connection, in seconds (3–300) |
 | Settle delay | Pause after connecting, before pinging (0–60 s) |
 
+### Automatic recovery
+
+Windscribe's client can stop responding after an aborted connection — its status line then reads
+`Connection:  Error: A required VPN process is not responding`, and no `connect`, `disconnect` or
+`firewall` call changes that. When AutoScribe sees this state, **it closes and restarts your
+Windscribe window** (the background service is left alone, and you stay signed in), then retries the
+route it was on. It does this at most three times per run; past that it stops and tells you to restart
+the client yourself.
+
+This means a run can make your Windscribe window disappear and come back. If you would rather drive
+that yourself, stop the run when the message appears instead of letting it continue.
+
+Every attempt is also written to `autoscribe.log` next to `main.py`. It is appended to on each launch
+(and rotated once past 2 MB) so a finished run stays readable afterwards.
+
 ## Files
 
 | File | Purpose |
@@ -90,6 +105,7 @@ python main.py
 | `config.json` | Your settings and profiles (created automatically) |
 | `windscribe_results.db` | SQLite database of results (created automatically) |
 | `reports/` | Exported CSV files |
+| `tests/` | Automated tests, run with `python -m pytest` |
 
 ## Building a standalone .exe
 
@@ -103,6 +119,17 @@ Put `locations.json` in the same folder as `dist\AutoScribe.exe`.
 ## Contributing
 
 Issues and pull requests are welcome. Fork the repository, make your change, and open a PR.
+
+To work on the code:
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest                                  # needs neither Tk nor a display
+ruff check --select E4,E7,E9,F --ignore E741 .    # the same lint CI runs
+```
+
+Translations live in `i18n.py`. Every string needs an `en`, `fa` and `ru` entry, and the `{placeholders}` must be the
+same in all three (a test checks this).
 
 ## License
 

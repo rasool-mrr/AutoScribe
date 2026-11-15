@@ -1,0 +1,3 @@
+# Development tools only. The tests do not need customtkinter or a display (see tests/conftest.py).
+pytest
+ruff

@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Pinned, not ubuntu-latest: that moved to Ubuntu 26.04, for which actions/setup-python
+    # has no Python 3.9 build, so the 3.9 job failed before installing anything.
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # The README promises Python 3.9+, so test both ends.
+        python-version: ["3.9", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install tools
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check --select E4,E7,E9,F --ignore E741 .
+
+      - name: Test
+        run: python -m pytest -q
