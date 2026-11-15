@@ -91,6 +91,10 @@ ICON_FALLBACK = {"globe": "◎", "list": "≡", "sliders": "⚙", "save": "S", "
 PROTO_NAMES = {"wireguard": "WireGuard", "ikev2": "IKEv2", "udp": "UDP", "tcp": "TCP",
                "stealth": "Stealth", "wstunnel": "WStunnel"}
 
+# A dead VPN engine is recoverable by restarting Windscribe, but only so many times in one run: past
+# this point the client is broken in a way a restart does not fix and the queue should not spin.
+MAX_STUCK_RECOVERIES = 3
+
 DEFAULT_PROTOCOLS = {
     "wireguard": [443, 80, 53, 123, 1194, 65142],
     "ikev2": [500],
@@ -682,9 +686,79 @@ class WindscribeWorker:
         up = out.upper()
         return "ERROR: A REQUIRED VPN PROCESS IS NOT RESPONDING" in up or "VPN PROCESS IS NOT RESPONDING" in up
 
+    @staticmethod
+    def windscribe_gui_running():
+        """True when Windscribe's GUI process exists, without adding a dependency for it.
+
+        tasklist on Windows, pgrep elsewhere - both ship with the OS.
+        """
+        if IS_WINDOWS:
+            out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Windscribe.exe", "/NH"],
+                                 capture_output=True, text=True, errors="replace",
+                                 **hidden_process_kwargs()).stdout
+            return "windscribe.exe" in out.lower()
+        out = subprocess.run(["pgrep", "-f", "Windscribe"], capture_output=True, text=True).stdout
+        return bool(out.strip())
+
+    def recover_engine(self, wait_seconds=60):
+        """Restart Windscribe's GUI and wait for the CLI to answer normally again.
+
+        Measured on this machine: killing only the GUI and starting it again restores
+        'Connection:  Disconnected' and keeps the account logged in, in about 12 s. The service is
+        left alone (it holds the adapters); the GUI is the process that dies after an Error 6.
+
+        The CLI must NOT be called while the GUI is down - it hangs instead of failing (a status
+        call sat for over four minutes), so this waits for the process first, and every probe uses
+        a short timeout of its own.
+        """
+        gui = DEFAULT_CLI.replace("windscribe-cli.exe", "Windscribe.exe")
+        if not os.path.exists(gui):
+            self.log(f"Cannot restart Windscribe: {gui} not found.", "FAILURE")
+            return False
+
+        self.log("Restarting Windscribe to clear the stuck VPN engine...", "WARN")
+        if IS_WINDOWS:
+            subprocess.run(["taskkill", "/IM", "Windscribe.exe", "/F"],
+                           capture_output=True, **hidden_process_kwargs())
+        else:
+            subprocess.run(["pkill", "-f", "Windscribe"], capture_output=True)
+
+        # Wait for the old process to actually leave before starting the new one.
+        gone = time.time() + 15
+        while time.time() < gone and self.windscribe_gui_running():
+            time.sleep(1)
+
+        try:
+            if IS_WINDOWS:
+                subprocess.Popen([gui], **hidden_process_kwargs())
+            else:
+                subprocess.Popen([gui])
+        except OSError as e:
+            self.log(f"Could not start Windscribe: {e}", "FAILURE")
+            return False
+
+        # Do not poke the CLI until the GUI is back: with it dead the call blocks for minutes.
+        deadline = time.time() + wait_seconds
+        while time.time() < deadline:
+            if self.stop_event.wait(3):
+                return False
+            if not self.windscribe_gui_running():
+                continue
+            code, out = self.run_cli(["status"], timeout=10)
+            if code != -1 and self.is_disconnected_output(out):
+                self.log("Windscribe is answering again.", "SUCCESS")
+                return True
+        self.log("Windscribe did not come back in time.", "FAILURE")
+        return False
+
     def ensure_disconnected(self):
         for _ in range(5):
             _, out = self.run_cli(["status"])
+            # Stuck first: a dead engine also reads as "nothing is tunnelled", so testing the
+            # disconnected case before this one would accept it and never restart the client.
+            if self.engine_is_stuck(out):
+                self.log("Windscribe's VPN engine is not responding; restarting it.", "WARN")
+                return self.recover_engine()
             if self.is_disconnected_output(out):
                 return True
             self.run_cli(["firewall", "off"])
@@ -774,6 +848,7 @@ class WindscribeWorker:
     def _run(self, work_plan, opts):
         kept_connection = None
         ok = fail = executed = 0
+        stuck_recoveries = 0
         try:
             locations, tasks = self._build_tasks(work_plan, opts)
             if not locations:
@@ -828,18 +903,34 @@ class WindscribeWorker:
                 connected, duration = self.wait_for_connection(start_ts, opts["timeout"])
 
                 # The VPN engine can die (an Error 6 abort leaves the client unable to answer for
-                # good). Nothing else will succeed until Windscribe is restarted, so stop the run and
-                # say so instead of recording a hundred identical FAILUREs.
+                # good). Restart it once and retry this same route; only give up if it stays broken,
+                # so one dead engine does not end a 200-test queue.
                 _, after = self.run_cli(["status"])
                 if self.engine_is_stuck(after):
                     self.phase(self.CONNECT, "fail")
-                    self.log("Windscribe's VPN engine stopped responding (see its Connection line). "
-                             "Close Windscribe, open it again, then restart this test - stopping here "
-                             "instead of recording the rest of the queue as failures.", "FAILURE")
-                    self.app.post(self.app.add_result_row, city, node, country, proto, port,
-                                  "CLI_STUCK", 0, None, None)
-                    fail += 1
-                    break
+                    if stuck_recoveries < MAX_STUCK_RECOVERIES and self.recover_engine():
+                        stuck_recoveries += 1
+                        self.log("Retrying this route after the restart.", "WARN")
+                        self.phase(self.CONNECT, "active")
+                        start_ts = time.time()
+                        self.run_cli(["connect", "-n", target, route], timeout=opts["timeout"] + 15)
+                        self.stop_event.wait(1)
+                        connected, duration = self.wait_for_connection(start_ts, opts["timeout"])
+                        _, after = self.run_cli(["status"])
+                        if self.engine_is_stuck(after):
+                            self.log("Windscribe broke again on the retry; stopping.", "FAILURE")
+                            self.app.post(self.app.add_result_row, city, node, country, proto, port,
+                                          "CLI_STUCK", 0, None, None)
+                            fail += 1
+                            break
+                    else:
+                        self.log("Windscribe's VPN engine stopped responding and could not be "
+                                 "restarted. Close Windscribe, open it again, then restart this "
+                                 "test.", "FAILURE")
+                        self.app.post(self.app.add_result_row, city, node, country, proto, port,
+                                      "CLI_STUCK", 0, None, None)
+                        fail += 1
+                        break
 
                 # User pressed Stop while we were still connecting: undo and leave, don't record a bogus failure.
                 if self.stop_event.is_set() and not connected:
