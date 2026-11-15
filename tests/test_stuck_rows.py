@@ -13,6 +13,16 @@ This pins both, plus the on-disk log that makes a lost run readable afterwards.
 import main
 
 
+class _FastClock:
+    def __init__(self, step=1.0):
+        self.t = 0.0
+        self.step = step
+
+    def __call__(self):
+        self.t += self.step
+        return self.t
+
+
 class FakeStop:
     def __init__(self):
         self._set = False
@@ -163,6 +173,11 @@ class StuckWorker(main.WindscribeWorker):
         self.db = FakeDB()
         self.restart_succeeds = restart_succeeds
         self.restarts = 0
+        # The readiness probe after a restart sleeps in real seconds; skip it in these tests.
+        self.now = _FastClock()
+
+    def wait_until_accepts_connect(self, target, route, attempts=5, probe_seconds=6):
+        return self.restart_succeeds
 
     def run_cli(self, args, timeout=30):
         if args and args[0] == "status":

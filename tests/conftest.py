@@ -39,3 +39,21 @@ try:
     import tkinter  # noqa: F401
 except ImportError:
     _stub_gui()
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _never_touch_the_users_files(tmp_path, monkeypatch):
+    """Every test runs against temp paths for the app's data files.
+
+    A test once opened the real windscribe_results.db and called clear_db(), deleting a user's
+    recorded results. Redirecting these for ALL tests makes that class of mistake impossible instead
+    of relying on each test remembering to do it.
+    """
+    import main
+    monkeypatch.setattr(main, "DB_FILE", str(tmp_path / "windscribe_results.db"))
+    monkeypatch.setattr(main, "CONFIG_FILE", str(tmp_path / "config.json"))
+    monkeypatch.setattr(main, "LOG_FILE", str(tmp_path / "autoscribe.log"))
+    monkeypatch.setattr(main, "REPORTS_DIR", str(tmp_path / "reports"))

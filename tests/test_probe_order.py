@@ -4,7 +4,12 @@ A probe that invents a protocol:port the client does not support reports "no con
 indistinguishable from a filtered port - the exact false negative that makes this tool useless. So
 the list is built from `windscribe-cli ports` and ORDER only reorders it.
 """
-import probe_protocols as probe
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "contrib"))
+
+import probe_protocols as probe  # noqa: E402
 
 
 class FakeRun:

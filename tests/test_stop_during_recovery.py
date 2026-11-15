@@ -117,10 +117,12 @@ def test_stopping_during_recovery_records_nothing(monkeypatch):
     assert worker.db.rows == []
 
 
-def test_is_tested_ignores_cli_stuck_rows():
+def test_is_tested_ignores_cli_stuck_rows(tmp_path, monkeypatch):
     # A stuck client is not a verdict about the route: Resume must re-test it later.
+    # DB_FILE must point at a temp file: without this the test opened the user's real results
+    # database and clear_db() deleted every row in it.
+    monkeypatch.setattr(main, "DB_FILE", str(tmp_path / "results.db"))
     db = main.DatabaseManager(app=None)
-    db.clear_db()
     db.record_result("Yarra", "Melbourne", "Australia", "stealth", 443, "CLI_STUCK", 0, None, None, "p")
     assert db.is_tested("Yarra", "Melbourne", "Australia", "stealth", 443) is False
     db.record_result("Yarra", "Melbourne", "Australia", "stealth", 443, "FAILURE", 0, None, None, "p")

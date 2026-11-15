@@ -10,7 +10,9 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: that moved to Ubuntu 26.04, for which actions/setup-python
+    # has no Python 3.9 build, so the 3.9 job failed before installing anything.
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:

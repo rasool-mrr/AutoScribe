@@ -36,7 +36,12 @@ PROTO_RE = re.compile(r'protocolDesc\\":\\"(\w+)\\"')
 
 
 def tail(path, offset):
-    """New bytes of a growing file, decoded loosely. Returns (text, new_offset)."""
+    """New complete lines of a growing file. Returns (text, new_offset).
+
+    Binary mode on purpose: it keeps the offset a real byte position, so a partial line at the end of
+    one read is returned whole by the next one. Text mode's f.tell() is an opaque cookie that cannot be
+    mixed with os.path.getsize(), and it silently drops a line split across two reads.
+    """
     try:
         size = os.path.getsize(path)
     except OSError:
@@ -45,9 +50,13 @@ def tail(path, offset):
         offset = 0
     if size == offset:
         return "", offset
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    with open(path, "rb") as f:
         f.seek(offset)
-        return f.read(), f.tell()
+        chunk = f.read()
+    cut = chunk.rfind(b"\n")       # keep the incomplete tail for the next call
+    if cut == -1:
+        return "", offset
+    return chunk[:cut + 1].decode("utf-8", errors="replace"), offset + cut + 1
 
 
 def main():
