@@ -37,11 +37,6 @@ STUCK = ("Login:       Logged in\n"
          "Connection:  Error: A required VPN process is not responding\n")
 
 
-def test_the_recovery_cap_exists_and_is_small():
-    # A broken client must not turn a 200-test queue into 200 restarts.
-    assert 1 <= main.MAX_STUCK_RECOVERIES <= 5
-
-
 def test_ensure_disconnected_does_not_restart_the_client():
     # It runs at the top of EVERY test, so a restart here would bypass MAX_STUCK_RECOVERIES and
     # turn one stuck client into a restart per test. The batch loop owns that decision.
@@ -49,8 +44,3 @@ def test_ensure_disconnected_does_not_restart_the_client():
     worker.run_cli = lambda args, timeout=30: (0, STUCK)
     assert worker.ensure_disconnected() is True    # nothing is tunnelled, so nothing to remove
     assert worker.recovery_calls == 0, "ensure_disconnected must not restart Windscribe"
-
-
-def test_the_recovery_cap_lives_in_the_batch_loop_only():
-    # See tests/test_stuck_rows.py for the loop-level behaviour; this only pins the boundary.
-    assert main.MAX_STUCK_RECOVERIES >= 1

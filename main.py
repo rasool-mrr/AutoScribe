@@ -119,6 +119,7 @@ CONFIG_FILE = os.path.join(APP_PATH, "config.json")
 LOCATIONS_FILE = os.path.join(APP_PATH, "locations.json")
 REPORTS_DIR = os.path.join(APP_PATH, "reports")
 LOG_FILE = os.path.join(APP_PATH, "autoscribe.log")
+LOG_MAX_BYTES = 2 * 1024 * 1024   # one rotated copy is kept; a run's log is a few hundred KB
 
 DEFAULT_CLI = r"C:\Program Files\Windscribe\windscribe-cli.exe" if IS_WINDOWS else "windscribe-cli"
 # The public server list that windscribe.com/vpn-servers loads; same format as locations.json.
@@ -678,7 +679,12 @@ class WindscribeWorker:
 
     def wait_for_connection(self, start_time, timeout, stable_reads=3):
         """Windscribe reports 'Connected' while the tunnel is still flapping, so one reading is not
-        proof: the same verdict has to hold for `stable_reads` consecutive polls."""
+        proof: the same verdict has to hold for `stable_reads` consecutive polls.
+
+        Consequence worth knowing: a connection that arrives less than ~stable_reads seconds before
+        the timeout is rejected, and the recorded connect time includes those confirmation polls. Both
+        are deliberate - a route that cannot hold for three seconds is not one to recommend.
+        """
         seen = 0
         while time.time() - start_time < timeout:
             _, out = self.run_cli(["status"])
@@ -752,7 +758,7 @@ class WindscribeWorker:
         'Connection:  Error: A required VPN process is not responding' until the GUI is restarted.
         """
         up = out.upper()
-        return "ERROR: A REQUIRED VPN PROCESS IS NOT RESPONDING" in up or "VPN PROCESS IS NOT RESPONDING" in up
+        return "VPN PROCESS IS NOT RESPONDING" in up
 
     @staticmethod
     def windscribe_gui_running():
@@ -779,7 +785,10 @@ class WindscribeWorker:
         call sat for over four minutes), so this waits for the process first, and every probe uses
         a short timeout of its own.
         """
-        gui = DEFAULT_CLI.replace("windscribe-cli.exe", "Windscribe.exe")
+        gui = self.cli_cmd.replace("windscribe-cli.exe", "Windscribe.exe")
+        if not os.path.exists(gui):
+            # A custom install path points at its own cli; fall back to the default layout.
+            gui = DEFAULT_CLI.replace("windscribe-cli.exe", "Windscribe.exe")
         if not os.path.exists(gui):
             self.log(f"Cannot restart Windscribe: {gui} not found.", "FAILURE")
             return False
@@ -850,18 +859,18 @@ class WindscribeWorker:
         self.stop_event.set()
         self.log("Stopping after the current step...", "WARN")
 
-    def connect_to(self, result, timeout):
+    def connect_to(self, result, timeout, ping_host="1.1.1.1"):
         """Connects to a single route picked from the results."""
         self.stop_event.clear()
         self.running = True
-        threading.Thread(target=self._connect_one, args=(result, timeout), daemon=True).start()
+        threading.Thread(target=self._connect_one, args=(result, timeout, ping_host), daemon=True).start()
 
     def disconnect(self):
         self.stop_event.clear()
         self.running = True
         threading.Thread(target=self._disconnect, daemon=True).start()
 
-    def _connect_one(self, r, timeout):
+    def _connect_one(self, r, timeout, ping_host="1.1.1.1"):
         connected = False
         route = f"{r['proto']}:{r['port']}"
         try:
@@ -881,7 +890,7 @@ class WindscribeWorker:
             expected = cli_server_name(r["city"], r.get("node", ""))
             if connected:
                 # Same rule as the batch runner: status text is not proof, a reply through the tunnel is.
-                carried, _res, _err = self.tunnel_carries_traffic("1.1.1.1", 3, expected=expected)
+                carried, _res, _err = self.tunnel_carries_traffic(ping_host, 3, expected=expected)
                 if not carried:
                     connected = False
                     self.phase(self.CONNECT, "fail")
@@ -892,6 +901,8 @@ class WindscribeWorker:
             else:
                 self.phase(self.CONNECT, "fail")
                 self.log(f"Could not connect to {r['city']} via {route}", "FAILURE")
+                # Leave nothing half-connected behind: the next action should not inherit this route.
+                self.run_cli(["disconnect"])
         except Exception as e:
             self.log(f"Critical Error: {e}", "FAILURE")
         finally:
@@ -1003,6 +1014,8 @@ class WindscribeWorker:
                         connected, duration = self.wait_for_connection(start_ts, opts["timeout"])
                         _, after = self.run_cli(["status"])
                         if self.engine_is_stuck(after):
+                            # The restart worked, so the client is fine; this ROUTE is what keeps
+                            # killing it. Record the route and carry on with the queue.
                             self.log("Windscribe broke again; recording this route and moving on.",
                                      "FAILURE")
                             self.db.record_result(node, city, country, proto, port, "CLI_STUCK", 0,
@@ -1012,6 +1025,8 @@ class WindscribeWorker:
                             fail += 1
                             continue
                     else:
+                        # No restart left. This is the opposite case from above: the CLIENT is what
+                        # is broken, so every remaining route would fail the same way. Stop.
                         if self.stop_event.is_set():
                             # The user pressed Stop while recovery was waiting. That is not a verdict
                             # about the route, so record nothing and leave cleanly.
@@ -1647,9 +1662,15 @@ class App(ctk.CTk):
 
         self.init_vars()
         # Opened before setup_ui(): the widgets report their own state while being built, and those
-        # lines belong in the file too.
+        # lines belong in the file too. Append, not truncate - the app relaunches itself after a
+        # language change, and truncating there threw away the evidence of the run just finished.
+        # Rotate once past LOG_MAX_BYTES so it cannot grow without bound.
         try:
-            self.log_file = open(LOG_FILE, "w", encoding="utf-8")
+            if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX_BYTES:
+                os.replace(LOG_FILE, LOG_FILE + ".1")
+            self.log_file = open(LOG_FILE, "a", encoding="utf-8")
+            self.log_file.write(f"\n=== {datetime.datetime.now():%Y-%m-%d %H:%M:%S} started ===\n")
+            self.log_file.flush()
         except OSError:
             self.log_file = None
         self.setup_ui()
@@ -3258,7 +3279,8 @@ class App(ctk.CTk):
             timeout = 25
         self.worker.cli_cmd = cli
         self.set_connected(None)
-        self.worker.connect_to(r, timeout)
+        host = self.entry_ping_host.get().strip() or "1.1.1.1"
+        self.worker.connect_to(r, timeout, host)
         self.set_running_ui(True)
         self.show_hero("live")
         self.set_target("cap_connecting", r["city"], r["node"], r["country"], f"{r['proto']}:{r['port']}")
