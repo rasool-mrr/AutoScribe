@@ -659,17 +659,40 @@ class WindscribeWorker:
             return True, result, None
         return False, None, err
 
+    @staticmethod
+    def is_disconnected_output(out):
+        """True when the tunnel is down. An error state also means nothing is connected.
+
+        The CLI can stop answering with 'Disconnected' and say
+        'Connection: Error: A required VPN process is not responding' instead, after the OpenVPN
+        engine has died. No tunnel exists in that state either, so treating it as "still connected"
+        made ensure_disconnected() burn five full retries and then skip every single test.
+        """
+        up = out.upper()
+        return "DISCONNECTED" in up or "CONNECTION:  ERROR" in up or "CONNECTION: ERROR" in up
+
+    @staticmethod
+    def engine_is_stuck(out):
+        """True when Windscribe's own engine is dead and no amount of retrying will help.
+
+        Seen on this machine after an Error 6: 'disconnect', 'firewall off' and fresh 'connect'
+        calls all leave the client at
+        'Connection:  Error: A required VPN process is not responding' until the GUI is restarted.
+        """
+        up = out.upper()
+        return "ERROR: A REQUIRED VPN PROCESS IS NOT RESPONDING" in up or "VPN PROCESS IS NOT RESPONDING" in up
+
     def ensure_disconnected(self):
         for _ in range(5):
             _, out = self.run_cli(["status"])
-            if "DISCONNECTED" in out.upper():
+            if self.is_disconnected_output(out):
                 return True
             self.run_cli(["firewall", "off"])
             self.run_cli(["disconnect"])
             if self.stop_event.wait(3):
                 break
         _, out = self.run_cli(["status"])
-        return "DISCONNECTED" in out.upper()
+        return self.is_disconnected_output(out)
 
     # -- job control --
     def start(self, work_plan, opts):
@@ -803,6 +826,20 @@ class WindscribeWorker:
                     continue
 
                 connected, duration = self.wait_for_connection(start_ts, opts["timeout"])
+
+                # The VPN engine can die (an Error 6 abort leaves the client unable to answer for
+                # good). Nothing else will succeed until Windscribe is restarted, so stop the run and
+                # say so instead of recording a hundred identical FAILUREs.
+                _, after = self.run_cli(["status"])
+                if self.engine_is_stuck(after):
+                    self.phase(self.CONNECT, "fail")
+                    self.log("Windscribe's VPN engine stopped responding (see its Connection line). "
+                             "Close Windscribe, open it again, then restart this test - stopping here "
+                             "instead of recording the rest of the queue as failures.", "FAILURE")
+                    self.app.post(self.app.add_result_row, city, node, country, proto, port,
+                                  "CLI_STUCK", 0, None, None)
+                    fail += 1
+                    break
 
                 # User pressed Stop while we were still connecting: undo and leave, don't record a bogus failure.
                 if self.stop_event.is_set() and not connected:
