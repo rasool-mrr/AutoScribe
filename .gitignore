@@ -16,3 +16,4 @@ reports/
 build/
 dist/
 *.spec
+autoscribe.log

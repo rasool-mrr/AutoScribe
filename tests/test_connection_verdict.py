@@ -30,6 +30,15 @@ def test_city_only_status_is_not_a_mismatch():
     assert main.is_different_server("Melbourne", "Melbourne - Yarra") is False
 
 
+def test_a_city_only_target_must_still_be_measured_against_the_right_city():
+    # connect_target() returns the city when an entry has no nickname, so `expected` can be a bare
+    # city. The old rule ("a city-only actual name proves nothing") also accepted a DIFFERENT city,
+    # which recorded one city's route as a success for another.
+    assert main.is_different_server("Sydney", "Melbourne - Yarra") is True
+    assert main.is_different_server("Melbourne", "Melbourne - Yarra") is False
+    assert main.is_different_server("Melbourne - Yarra", "Melbourne - Yarra") is False
+
+
 def test_unknown_status_is_not_a_mismatch():
     assert main.is_different_server("", "Melbourne - Yarra") is False
 

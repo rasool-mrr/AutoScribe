@@ -315,6 +315,7 @@ STRINGS = {
     "status_SUCCESS": {"en": "Connected", "fa": "متصل شد", "ru": "Подключено"},
     "status_FAILURE": {"en": "Timed out", "fa": "پایان مهلت", "ru": "Тайм-аут"},
     "status_INVALID_LOC": {"en": "Unavailable", "fa": "ناموجود", "ru": "Недоступно"},
+    "status_CLI_STUCK": {"en": "VPN stuck", "fa": "وایند گیر کرد", "ru": "VPN завис"},
     "menu_connect": {"en": "Connect to this route", "fa": "اتصال به این مسیر", "ru": "Подключиться к этому маршруту"},
     "menu_copy_route": {"en": "Copy route", "fa": "کپی مسیر", "ru": "Копировать маршрут"},
     "menu_copy_row": {"en": "Copy row", "fa": "کپی ردیف", "ru": "Копировать строку"},

@@ -91,6 +91,15 @@ ICON_FALLBACK = {"globe": "◎", "list": "≡", "sliders": "⚙", "save": "S", "
 PROTO_NAMES = {"wireguard": "WireGuard", "ikev2": "IKEv2", "udp": "UDP", "tcp": "TCP",
                "stealth": "Stealth", "wstunnel": "WStunnel"}
 
+# A dead VPN engine is recoverable by restarting Windscribe, but only so many times in one run: past
+# this point the client is broken in a way a restart does not fix and the queue should not spin.
+MAX_STUCK_RECOVERIES = 3
+
+# With the GUI process dead the CLI does not fail, it blocks - every call burns its full timeout. Two
+# such calls in a row is the same dead end as the Error-6 status text, so recovery treats them alike
+# instead of retrying until the user gives up.
+HUNG_TIMEOUT_STREAK = 2
+
 DEFAULT_PROTOCOLS = {
     "wireguard": [443, 80, 53, 123, 1194, 65142],
     "ikev2": [500],
@@ -109,6 +118,7 @@ DB_FILE = os.path.join(APP_PATH, "windscribe_results.db")
 CONFIG_FILE = os.path.join(APP_PATH, "config.json")
 LOCATIONS_FILE = os.path.join(APP_PATH, "locations.json")
 REPORTS_DIR = os.path.join(APP_PATH, "reports")
+LOG_FILE = os.path.join(APP_PATH, "autoscribe.log")
 
 DEFAULT_CLI = r"C:\Program Files\Windscribe\windscribe-cli.exe" if IS_WINDOWS else "windscribe-cli"
 # The public server list that windscribe.com/vpn-servers loads; same format as locations.json.
@@ -231,17 +241,28 @@ def cli_server_name(city, node):
 
 
 def is_different_server(actual, expected):
-    """True only when the CLI explicitly names a server other than the one that was requested.
+    """True when the CLI names a server other than the one that was requested.
 
-    A missing or city-only name proves nothing (some entries answer with just the city), so it is
-    never treated as a mismatch; only a fully qualified 'City - Nickname' that differs is.
+    Compared at the granularity both names actually offer: a city mismatch is always a mismatch, a
+    nickname mismatch only when both sides name a nickname. That covers all four cases, including
+    `expected` being a bare city (connect_target() falls back to the city for entries without a
+    nickname) and `actual` being bare (some entries answer with just the city).
+
+    A missing name proves nothing - an unreadable status line is not evidence of a wrong server - so
+    empty values are never a mismatch.
     """
     if not actual or not expected:
         return False
     a, e = actual.strip().lower(), expected.strip().lower()
     if a == e:
         return False
-    return " - " in a
+    a_city, _, a_nick = a.partition(" - ")
+    e_city, _, e_nick = e.partition(" - ")
+    if a_city.strip() != e_city.strip():
+        return True
+    if not a_nick or not e_nick:
+        return False      # same city, but one side does not name the datacenter
+    return a_nick.strip() != e_nick.strip()
 
 
 def matches_region(loc, region):
@@ -396,12 +417,15 @@ class LocationManager:
 # Ping - uses the system `ping`, nothing else to install
 # ---------------------------------------------------------------------------
 class PingRunner:
-    # Latency of a reply: "time=12.3 ms" on Linux, macOS and English Windows ("time<1ms" for very fast replies).
+    # Latency of a reply as an explicit word: "time=12.3 ms" (Linux, macOS, English Windows),
+    # "time<1ms" for very fast replies.
     TIME_RE = re.compile(r"\btime\s*[=<]\s*(\d+(?:[.,]\d+)?)", re.IGNORECASE)
-    # Windows translates the whole line ("время=20мс", "Zeit=18ms") and prints it in the console's OEM code page,
-    # which arrives here as replacement characters, so the word "time" can't be matched. The latency is always
-    # the number just before "TTL=", whatever the language.
-    BEFORE_TTL_RE = re.compile(r"[=<]\s*(\d+(?:[.,]\d+)?)[^\d=<]*?\bttl\s*=", re.IGNORECASE)
+    # Localized output translates that word ("Zeit=18ms", "время=12.3 мс"), and Windows prints it in the console
+    # OEM code page so it arrives as replacement characters. Then the latency is only findable by shape: the one
+    # "=<number>" pair on the line that is neither the sequence number nor the ttl value.
+    NUM_AT_RE = re.compile(r"[=<]\s*(\d+(?:[.,]\d+)?)")
+    SEQ_AT_RE = re.compile(r"(?:icmp_seq|icmp_req|seq)\s*=\s*\d+", re.IGNORECASE)
+    TTL_AT_RE = re.compile(r"\bttl\s*=\s*(\d+)", re.IGNORECASE)
 
     @staticmethod
     def parse(output):
@@ -409,11 +433,23 @@ class PingRunner:
         keeps the 'Minimum/Maximum/Average' summary line on Windows out of the numbers."""
         times = []
         for line in output.splitlines():
-            if "ttl" not in line.lower():
+            ttl = PingRunner.TTL_AT_RE.search(line)
+            if not ttl:
                 continue
-            m = PingRunner.TIME_RE.search(line) or PingRunner.BEFORE_TTL_RE.search(line)
+            m = PingRunner.TIME_RE.search(line)
             if m:
                 times.append(float(m.group(1).replace(",", ".")))
+                continue
+            # Blank out the sequence number and the ttl value, then the last number left is the latency:
+            # Windows writes bytes= before the latency, Linux writes the latency after the ttl.
+            masked = PingRunner.SEQ_AT_RE.sub(lambda s: " " * len(s.group(0)), line)
+            ttl = PingRunner.TTL_AT_RE.search(masked)      # re-locate: the substitution above shifted offsets
+            if not ttl:
+                continue
+            masked = masked[:ttl.start()] + " " * len(ttl.group(0)) + masked[ttl.end():]
+            left = [c for c in PingRunner.NUM_AT_RE.finditer(masked)]
+            if left:
+                times.append(float(left[-1].group(1).replace(",", ".")))
         return times
 
     def run(self, host, count=5, reply_timeout_ms=2000):
@@ -509,9 +545,15 @@ class DatabaseManager:
                 return 0
 
     def is_tested(self, location, city, country, proto, port):
+        """True when this route already has a real verdict.
+
+        CLI_STUCK is excluded on purpose: it says the Windscribe client was broken at that moment,
+        not that the route does not work. Counting it would make Resume skip that route forever.
+        """
         with self.lock:
             self.cursor.execute(
-                "SELECT 1 FROM tests WHERE location=? AND city=? AND country=? AND protocol=? AND port=?",
+                "SELECT 1 FROM tests WHERE location=? AND city=? AND country=? AND protocol=? AND port=?"
+                " AND status <> 'CLI_STUCK'",
                 (location, city, country, proto, port))
             return self.cursor.fetchone() is not None
 
@@ -575,6 +617,7 @@ class WindscribeWorker:
         self.stop_event = threading.Event()
         self.running = False
         self.cli_cmd = cli_cmd
+        self.consecutive_timeouts = 0
 
     # -- helpers (all UI access goes through app.post, never touches widgets directly) --
     def log(self, msg, tag="INFO"):
@@ -588,12 +631,24 @@ class WindscribeWorker:
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
                                     timeout=timeout, **hidden_process_kwargs())
+            self.consecutive_timeouts = 0
             return result.returncode, result.stdout
         except subprocess.TimeoutExpired:
+            self.consecutive_timeouts += 1
             return -1, ""
         except Exception as e:
+            self.consecutive_timeouts = 0
             self.log(f"CLI Error: {e}", "FAILURE")
             return -1, ""
+
+    def engine_is_hung(self):
+        """True when the CLI has stopped answering altogether.
+
+        A dead GUI makes windscribe-cli block rather than fail, so the only symptom is a run of
+        timeouts with no output. That is a dead end just like the Error-6 status text, and the same
+        restart clears it - but nothing else here would notice it.
+        """
+        return self.consecutive_timeouts >= HUNG_TIMEOUT_STREAK
 
     @staticmethod
     def is_connected_output(out):
@@ -642,6 +697,10 @@ class WindscribeWorker:
         routes the ping silently goes out over the physical link and succeeds. So the status has to
         read connected both before and after the ping.
 
+        A status read that cannot be read at all is not evidence of a drop: run_cli returns (-1, "")
+        when the CLI itself times out, which happens under load. Only a readable, non-connected
+        status counts as "the tunnel died", so a CLI hiccup cannot throw away a good ping.
+
         `expected` is the 'City - Nickname' the caller asked for. When Windscribe lands on a different
         server the test does not describe the route the user picked, so it is not a success either.
         """
@@ -653,23 +712,133 @@ class WindscribeWorker:
             if is_different_server(actual, expected):
                 return False, None, f"connected to {actual} instead of {expected}"
         result, err = self.pinger.run(ping_host, ping_count)
-        if not self.is_connected_output(self.run_cli(["status"])[1]):
+        if not self.status_reads_connected():
             return False, result, "the connection dropped during the ping"
         if result:
             return True, result, None
         return False, None, err
 
+    def status_reads_connected(self, retries=1):
+        """True when a *readable* status says connected. An unreadable read is retried, not judged.
+
+        Returns False only on a status the CLI actually produced and that does not say connected, so
+        a timeout cannot be mistaken for a dropped tunnel.
+        """
+        for _ in range(retries + 1):
+            code, out = self.run_cli(["status"])
+            if code == -1 and not out:
+                continue          # the CLI did not answer; that says nothing about the tunnel
+            return self.is_connected_output(out)
+        return False
+
+    @staticmethod
+    def is_disconnected_output(out):
+        """True when the tunnel is down. An error state also means nothing is connected.
+
+        The CLI can stop answering with 'Disconnected' and say
+        'Connection: Error: A required VPN process is not responding' instead, after the OpenVPN
+        engine has died. No tunnel exists in that state either, so treating it as "still connected"
+        made ensure_disconnected() burn five full retries and then skip every single test.
+        """
+        up = out.upper()
+        return "DISCONNECTED" in up or "CONNECTION:  ERROR" in up or "CONNECTION: ERROR" in up
+
+    @staticmethod
+    def engine_is_stuck(out):
+        """True when Windscribe's own engine is dead and no amount of retrying will help.
+
+        Seen on this machine after an Error 6: 'disconnect', 'firewall off' and fresh 'connect'
+        calls all leave the client at
+        'Connection:  Error: A required VPN process is not responding' until the GUI is restarted.
+        """
+        up = out.upper()
+        return "ERROR: A REQUIRED VPN PROCESS IS NOT RESPONDING" in up or "VPN PROCESS IS NOT RESPONDING" in up
+
+    @staticmethod
+    def windscribe_gui_running():
+        """True when Windscribe's GUI process exists, without adding a dependency for it.
+
+        tasklist on Windows, pgrep elsewhere - both ship with the OS.
+        """
+        if IS_WINDOWS:
+            out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Windscribe.exe", "/NH"],
+                                 capture_output=True, text=True, errors="replace",
+                                 **hidden_process_kwargs()).stdout
+            return "windscribe.exe" in out.lower()
+        out = subprocess.run(["pgrep", "-f", "Windscribe"], capture_output=True, text=True).stdout
+        return bool(out.strip())
+
+    def recover_engine(self, wait_seconds=60):
+        """Restart Windscribe's GUI and wait for the CLI to answer normally again.
+
+        Measured on this machine: killing only the GUI and starting it again restores
+        'Connection:  Disconnected' and keeps the account logged in, in about 12 s. The service is
+        left alone (it holds the adapters); the GUI is the process that dies after an Error 6.
+
+        The CLI must NOT be called while the GUI is down - it hangs instead of failing (a status
+        call sat for over four minutes), so this waits for the process first, and every probe uses
+        a short timeout of its own.
+        """
+        gui = DEFAULT_CLI.replace("windscribe-cli.exe", "Windscribe.exe")
+        if not os.path.exists(gui):
+            self.log(f"Cannot restart Windscribe: {gui} not found.", "FAILURE")
+            return False
+
+        self.log("Restarting Windscribe to clear the stuck VPN engine...", "WARN")
+        if IS_WINDOWS:
+            subprocess.run(["taskkill", "/IM", "Windscribe.exe", "/F"],
+                           capture_output=True, **hidden_process_kwargs())
+        else:
+            subprocess.run(["pkill", "-f", "Windscribe"], capture_output=True)
+
+        # Wait for the old process to actually leave before starting the new one.
+        gone = time.time() + 15
+        while time.time() < gone and self.windscribe_gui_running():
+            time.sleep(1)
+
+        try:
+            if IS_WINDOWS:
+                subprocess.Popen([gui], **hidden_process_kwargs())
+            else:
+                subprocess.Popen([gui])
+        except OSError as e:
+            self.log(f"Could not start Windscribe: {e}", "FAILURE")
+            return False
+
+        # Do not poke the CLI until the GUI is back: with it dead the call blocks for minutes.
+        deadline = time.time() + wait_seconds
+        while time.time() < deadline:
+            if self.stop_event.wait(3):
+                return False
+            if not self.windscribe_gui_running():
+                continue
+            code, out = self.run_cli(["status"], timeout=10)
+            if code != -1 and self.is_disconnected_output(out):
+                self.log("Windscribe is answering again.", "SUCCESS")
+                return True
+        self.log("Windscribe did not come back in time.", "FAILURE")
+        return False
+
     def ensure_disconnected(self):
         for _ in range(5):
             _, out = self.run_cli(["status"])
-            if "DISCONNECTED" in out.upper():
+            # A dead engine also reads as "nothing is tunnelled", so there is nothing to disconnect.
+            # Recovery is deliberately NOT done here: this runs at the top of every test, and
+            # restarting Windscribe from here would bypass MAX_STUCK_RECOVERIES and turn a stuck
+            # client into one restart per test. The batch loop owns that decision.
+            if self.is_disconnected_output(out):
                 return True
+            if self.engine_is_hung():
+                # The CLI just burned a full timeout; more calls would only waste minutes.
+                return False
             self.run_cli(["firewall", "off"])
+            if self.engine_is_hung():
+                return False
             self.run_cli(["disconnect"])
             if self.stop_event.wait(3):
                 break
         _, out = self.run_cli(["status"])
-        return "DISCONNECTED" in out.upper()
+        return self.is_disconnected_output(out)
 
     # -- job control --
     def start(self, work_plan, opts):
@@ -751,6 +920,7 @@ class WindscribeWorker:
     def _run(self, work_plan, opts):
         kept_connection = None
         ok = fail = executed = 0
+        stuck_recoveries = 0
         try:
             locations, tasks = self._build_tasks(work_plan, opts)
             if not locations:
@@ -779,8 +949,17 @@ class WindscribeWorker:
                 t0 = time.time()
                 if not self.ensure_disconnected():
                     self.phase(self.DISCONNECT, "fail")
-                    self.log("Could not disconnect, skipping this test.", "FAILURE")
-                    continue
+                    recovered = False
+                    if self.engine_is_hung() and stuck_recoveries < MAX_STUCK_RECOVERIES:
+                        # Same dead end as the Error-6 text, same cure. This is the only other place
+                        # allowed to restart, so the cap still holds.
+                        stuck_recoveries += 1
+                        recovered = self.recover_engine()
+                        if recovered:
+                            self.log("Windscribe stopped answering; restarted it.", "WARN")
+                    if not recovered:
+                        self.log("Could not disconnect, skipping this test.", "FAILURE")
+                        continue
                 self.phase(self.DISCONNECT, "done", time.time() - t0)
                 if self.stop_event.is_set():
                     break
@@ -803,6 +982,51 @@ class WindscribeWorker:
                     continue
 
                 connected, duration = self.wait_for_connection(start_ts, opts["timeout"])
+
+                # The VPN engine can die (an Error 6 abort leaves the client unable to answer for
+                # good). Restart it and retry this route once. If it dies again on the retry, record
+                # the route and move on: Error 6 strikes individual Stealth/WStunnel attempts, so
+                # aborting the whole queue for one bad route is what threw away the rest of a run.
+                _, after = self.run_cli(["status"])
+                if self.engine_is_stuck(after):
+                    self.phase(self.CONNECT, "fail")
+                    restarted = False
+                    if stuck_recoveries < MAX_STUCK_RECOVERIES:
+                        stuck_recoveries += 1
+                        restarted = self.recover_engine()
+                    if restarted:
+                        self.log("Retrying this route after the restart.", "WARN")
+                        self.phase(self.CONNECT, "active")
+                        start_ts = time.time()
+                        self.run_cli(["connect", "-n", target, route], timeout=opts["timeout"] + 15)
+                        self.stop_event.wait(1)
+                        connected, duration = self.wait_for_connection(start_ts, opts["timeout"])
+                        _, after = self.run_cli(["status"])
+                        if self.engine_is_stuck(after):
+                            self.log("Windscribe broke again; recording this route and moving on.",
+                                     "FAILURE")
+                            self.db.record_result(node, city, country, proto, port, "CLI_STUCK", 0,
+                                                  None, None, opts["profile_name"])
+                            self.app.post(self.app.add_result_row, city, node, country, proto, port,
+                                          "CLI_STUCK", 0, None, None)
+                            fail += 1
+                            continue
+                    else:
+                        if self.stop_event.is_set():
+                            # The user pressed Stop while recovery was waiting. That is not a verdict
+                            # about the route, so record nothing and leave cleanly.
+                            self.log("Stopped during recovery; this test was not recorded.", "WARN")
+                            break
+                        self.log(f"Windscribe's VPN engine stopped responding and could not be "
+                                 f"restarted ({stuck_recoveries}/{MAX_STUCK_RECOVERIES} restarts "
+                                 f"used). Close Windscribe, open it again, then restart the run.",
+                                 "FAILURE")
+                        self.db.record_result(node, city, country, proto, port, "CLI_STUCK", 0,
+                                              None, None, opts["profile_name"])
+                        self.app.post(self.app.add_result_row, city, node, country, proto, port,
+                                      "CLI_STUCK", 0, None, None)
+                        fail += 1
+                        break
 
                 # User pressed Stop while we were still connecting: undo and leave, don't record a bogus failure.
                 if self.stop_event.is_set() and not connected:
@@ -1417,10 +1641,17 @@ class App(ctk.CTk):
 
         size, radius = max(10, int(14 * self.scale)), 4.0 * self.scale
         self.dots = {"SUCCESS": make_dot(GOOD, size, radius), "FAILURE": make_dot(BAD, size, radius),
-                     "INVALID_LOC": make_dot(WARN, size, radius), "fast": make_dot(GOOD, size, radius),
+                     "INVALID_LOC": make_dot(WARN, size, radius), "CLI_STUCK": make_dot(BAD, size, radius),
+                     "fast": make_dot(GOOD, size, radius),
                      "medium": make_dot(WARN, size, radius), "slow": make_dot(BAD, size, radius)}
 
         self.init_vars()
+        # Opened before setup_ui(): the widgets report their own state while being built, and those
+        # lines belong in the file too.
+        try:
+            self.log_file = open(LOG_FILE, "w", encoding="utf-8")
+        except OSError:
+            self.log_file = None
         self.setup_ui()
         self.worker = WindscribeWorker(self, resolve_cli(self.entry_cli.get()) or DEFAULT_CLI)
         self.apply_config_to_ui(self.last_settings)
@@ -2454,6 +2685,14 @@ class App(ctk.CTk):
         self.log_box.insert("end", msg + "\n", tag)
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
+        # Also keep it on disk: the widget is the only copy otherwise, and it is lost whenever the
+        # window is rebuilt (language change restarts the app) - which loses the evidence for a run.
+        if self.log_file is not None:
+            try:
+                self.log_file.write(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S}  [{tag}] {msg}\n")
+                self.log_file.flush()
+            except (OSError, ValueError):
+                self.log_file = None
 
     def clear_logs(self):
         self.log_box.configure(state="normal")
