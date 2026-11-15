@@ -236,17 +236,28 @@ def cli_server_name(city, node):
 
 
 def is_different_server(actual, expected):
-    """True only when the CLI explicitly names a server other than the one that was requested.
+    """True when the CLI names a server other than the one that was requested.
 
-    A missing or city-only name proves nothing (some entries answer with just the city), so it is
-    never treated as a mismatch; only a fully qualified 'City - Nickname' that differs is.
+    Compared at the granularity both names actually offer: a city mismatch is always a mismatch, a
+    nickname mismatch only when both sides name a nickname. That covers all four cases, including
+    `expected` being a bare city (connect_target() falls back to the city for entries without a
+    nickname) and `actual` being bare (some entries answer with just the city).
+
+    A missing name proves nothing - an unreadable status line is not evidence of a wrong server - so
+    empty values are never a mismatch.
     """
     if not actual or not expected:
         return False
     a, e = actual.strip().lower(), expected.strip().lower()
     if a == e:
         return False
-    return " - " in a
+    a_city, _, a_nick = a.partition(" - ")
+    e_city, _, e_nick = e.partition(" - ")
+    if a_city.strip() != e_city.strip():
+        return True
+    if not a_nick or not e_nick:
+        return False      # same city, but one side does not name the datacenter
+    return a_nick.strip() != e_nick.strip()
 
 
 def matches_region(loc, region):
