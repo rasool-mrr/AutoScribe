@@ -113,6 +113,7 @@ DB_FILE = os.path.join(APP_PATH, "windscribe_results.db")
 CONFIG_FILE = os.path.join(APP_PATH, "config.json")
 LOCATIONS_FILE = os.path.join(APP_PATH, "locations.json")
 REPORTS_DIR = os.path.join(APP_PATH, "reports")
+LOG_FILE = os.path.join(APP_PATH, "autoscribe.log")
 
 DEFAULT_CLI = r"C:\Program Files\Windscribe\windscribe-cli.exe" if IS_WINDOWS else "windscribe-cli"
 # The public server list that windscribe.com/vpn-servers loads; same format as locations.json.
@@ -754,11 +755,10 @@ class WindscribeWorker:
     def ensure_disconnected(self):
         for _ in range(5):
             _, out = self.run_cli(["status"])
-            # Stuck first: a dead engine also reads as "nothing is tunnelled", so testing the
-            # disconnected case before this one would accept it and never restart the client.
-            if self.engine_is_stuck(out):
-                self.log("Windscribe's VPN engine is not responding; restarting it.", "WARN")
-                return self.recover_engine()
+            # A dead engine also reads as "nothing is tunnelled", so there is nothing to disconnect.
+            # Recovery is deliberately NOT done here: this runs at the top of every test, and
+            # restarting Windscribe from here would bypass MAX_STUCK_RECOVERIES and turn a stuck
+            # client into one restart per test. The batch loop owns that decision.
             if self.is_disconnected_output(out):
                 return True
             self.run_cli(["firewall", "off"])
@@ -903,13 +903,17 @@ class WindscribeWorker:
                 connected, duration = self.wait_for_connection(start_ts, opts["timeout"])
 
                 # The VPN engine can die (an Error 6 abort leaves the client unable to answer for
-                # good). Restart it once and retry this same route; only give up if it stays broken,
-                # so one dead engine does not end a 200-test queue.
+                # good). Restart it and retry this route once. If it dies again on the retry, record
+                # the route and move on: Error 6 strikes individual Stealth/WStunnel attempts, so
+                # aborting the whole queue for one bad route is what threw away the rest of a run.
                 _, after = self.run_cli(["status"])
                 if self.engine_is_stuck(after):
                     self.phase(self.CONNECT, "fail")
-                    if stuck_recoveries < MAX_STUCK_RECOVERIES and self.recover_engine():
+                    restarted = False
+                    if stuck_recoveries < MAX_STUCK_RECOVERIES:
                         stuck_recoveries += 1
+                        restarted = self.recover_engine()
+                    if restarted:
                         self.log("Retrying this route after the restart.", "WARN")
                         self.phase(self.CONNECT, "active")
                         start_ts = time.time()
@@ -918,15 +922,21 @@ class WindscribeWorker:
                         connected, duration = self.wait_for_connection(start_ts, opts["timeout"])
                         _, after = self.run_cli(["status"])
                         if self.engine_is_stuck(after):
-                            self.log("Windscribe broke again on the retry; stopping.", "FAILURE")
+                            self.log("Windscribe broke again; recording this route and moving on.",
+                                     "FAILURE")
+                            self.db.record_result(node, city, country, proto, port, "CLI_STUCK", 0,
+                                                  None, None, opts["profile_name"])
                             self.app.post(self.app.add_result_row, city, node, country, proto, port,
                                           "CLI_STUCK", 0, None, None)
                             fail += 1
-                            break
+                            continue
                     else:
-                        self.log("Windscribe's VPN engine stopped responding and could not be "
-                                 "restarted. Close Windscribe, open it again, then restart this "
-                                 "test.", "FAILURE")
+                        self.log(f"Windscribe's VPN engine stopped responding and could not be "
+                                 f"restarted ({stuck_recoveries}/{MAX_STUCK_RECOVERIES} restarts "
+                                 f"used). Close Windscribe, open it again, then restart the run.",
+                                 "FAILURE")
+                        self.db.record_result(node, city, country, proto, port, "CLI_STUCK", 0,
+                                              None, None, opts["profile_name"])
                         self.app.post(self.app.add_result_row, city, node, country, proto, port,
                                       "CLI_STUCK", 0, None, None)
                         fail += 1
@@ -1545,10 +1555,17 @@ class App(ctk.CTk):
 
         size, radius = max(10, int(14 * self.scale)), 4.0 * self.scale
         self.dots = {"SUCCESS": make_dot(GOOD, size, radius), "FAILURE": make_dot(BAD, size, radius),
-                     "INVALID_LOC": make_dot(WARN, size, radius), "fast": make_dot(GOOD, size, radius),
+                     "INVALID_LOC": make_dot(WARN, size, radius), "CLI_STUCK": make_dot(BAD, size, radius),
+                     "fast": make_dot(GOOD, size, radius),
                      "medium": make_dot(WARN, size, radius), "slow": make_dot(BAD, size, radius)}
 
         self.init_vars()
+        # Opened before setup_ui(): the widgets report their own state while being built, and those
+        # lines belong in the file too.
+        try:
+            self.log_file = open(LOG_FILE, "w", encoding="utf-8")
+        except OSError:
+            self.log_file = None
         self.setup_ui()
         self.worker = WindscribeWorker(self, resolve_cli(self.entry_cli.get()) or DEFAULT_CLI)
         self.apply_config_to_ui(self.last_settings)
@@ -2582,6 +2599,14 @@ class App(ctk.CTk):
         self.log_box.insert("end", msg + "\n", tag)
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
+        # Also keep it on disk: the widget is the only copy otherwise, and it is lost whenever the
+        # window is rebuilt (language change restarts the app) - which loses the evidence for a run.
+        if self.log_file is not None:
+            try:
+                self.log_file.write(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S}  [{tag}] {msg}\n")
+                self.log_file.flush()
+            except (OSError, ValueError):
+                self.log_file = None
 
     def clear_logs(self):
         self.log_box.configure(state="normal")

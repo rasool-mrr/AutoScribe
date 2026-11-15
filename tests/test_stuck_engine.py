@@ -63,17 +63,9 @@ class FakeWorker(main.WindscribeWorker):
 
 
 def test_ensure_disconnected_recovers_the_stuck_state_instead_of_looping():
-    # The disconnect handshake must not burn five retries against a dead engine: it restarts the
-    # client. (The synchronous acceptance path was replaced by auto-recovery on purpose.)
+    # A dead engine reads as "nothing is tunnelled", so the disconnect handshake resolves at once
+    # and the batch loop - not this call - decides whether to restart Windscribe.
     worker = FakeWorker([STUCK])
-    recovered = []
-
-    def fake_recover(wait_seconds=60):
-        recovered.append(True)
-        return True
-
-    worker.recover_engine = fake_recover
     worker.log = lambda msg, tag="INFO": None
     assert worker.ensure_disconnected() is True
-    assert recovered == [True], "the stuck state was not handed to recover_engine()"
     assert worker.calls == 1, "it should decide on the first status read, not retry five times"
