@@ -417,12 +417,15 @@ class LocationManager:
 # Ping - uses the system `ping`, nothing else to install
 # ---------------------------------------------------------------------------
 class PingRunner:
-    # Latency of a reply: "time=12.3 ms" on Linux, macOS and English Windows ("time<1ms" for very fast replies).
+    # Latency of a reply as an explicit word: "time=12.3 ms" (Linux, macOS, English Windows),
+    # "time<1ms" for very fast replies.
     TIME_RE = re.compile(r"\btime\s*[=<]\s*(\d+(?:[.,]\d+)?)", re.IGNORECASE)
-    # Windows translates the whole line ("время=20мс", "Zeit=18ms") and prints it in the console's OEM code page,
-    # which arrives here as replacement characters, so the word "time" can't be matched. The latency is always
-    # the number just before "TTL=", whatever the language.
-    BEFORE_TTL_RE = re.compile(r"[=<]\s*(\d+(?:[.,]\d+)?)[^\d=<]*?\bttl\s*=", re.IGNORECASE)
+    # Localized output translates that word ("Zeit=18ms", "время=12.3 мс"), and Windows prints it in the console
+    # OEM code page so it arrives as replacement characters. Then the latency is only findable by shape: the one
+    # "=<number>" pair on the line that is neither the sequence number nor the ttl value.
+    NUM_AT_RE = re.compile(r"[=<]\s*(\d+(?:[.,]\d+)?)")
+    SEQ_AT_RE = re.compile(r"(?:icmp_seq|icmp_req|seq)\s*=\s*\d+", re.IGNORECASE)
+    TTL_AT_RE = re.compile(r"\bttl\s*=\s*(\d+)", re.IGNORECASE)
 
     @staticmethod
     def parse(output):
@@ -430,11 +433,23 @@ class PingRunner:
         keeps the 'Minimum/Maximum/Average' summary line on Windows out of the numbers."""
         times = []
         for line in output.splitlines():
-            if "ttl" not in line.lower():
+            ttl = PingRunner.TTL_AT_RE.search(line)
+            if not ttl:
                 continue
-            m = PingRunner.TIME_RE.search(line) or PingRunner.BEFORE_TTL_RE.search(line)
+            m = PingRunner.TIME_RE.search(line)
             if m:
                 times.append(float(m.group(1).replace(",", ".")))
+                continue
+            # Blank out the sequence number and the ttl value, then the last number left is the latency:
+            # Windows writes bytes= before the latency, Linux writes the latency after the ttl.
+            masked = PingRunner.SEQ_AT_RE.sub(lambda s: " " * len(s.group(0)), line)
+            ttl = PingRunner.TTL_AT_RE.search(masked)      # re-locate: the substitution above shifted offsets
+            if not ttl:
+                continue
+            masked = masked[:ttl.start()] + " " * len(ttl.group(0)) + masked[ttl.end():]
+            left = [c for c in PingRunner.NUM_AT_RE.finditer(masked)]
+            if left:
+                times.append(float(left[-1].group(1).replace(",", ".")))
         return times
 
     def run(self, host, count=5, reply_timeout_ms=2000):
