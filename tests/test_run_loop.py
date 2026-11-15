@@ -88,6 +88,7 @@ class FakeWorker(main.WindscribeWorker):
         self.stop_event = FakeStop()
         self.running = False
         self.cli_cmd = "fake"
+        self.consecutive_timeouts = 0
         self.pinger = FakePinger(ping_works)
         self._statuses = list(statuses)
         self._connected = False

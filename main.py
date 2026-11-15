@@ -710,7 +710,7 @@ class WindscribeWorker:
         `expected` is the 'City - Nickname' the caller asked for. When Windscribe lands on a different
         server the test does not describe the route the user picked, so it is not a success either.
         """
-        before = self.run_cli(["status"])[1]
+        before = self.read_status()
         if not self.is_connected_output(before):
             return False, None, "not connected before the ping"
         if expected:
@@ -724,18 +724,31 @@ class WindscribeWorker:
             return True, result, None
         return False, None, err
 
-    def status_reads_connected(self, retries=1):
-        """True when a *readable* status says connected. An unreadable read is retried, not judged.
+    def read_status(self, retries=1):
+        """The text of a status the CLI actually produced, or "" if it never answered.
 
-        Returns False only on a status the CLI actually produced and that does not say connected, so
-        a timeout cannot be mistaken for a dropped tunnel.
+        One timed-out read says nothing about the tunnel, so it is retried once before giving up.
+        The first read in tunnel_carries_traffic needs this as much as the one after the ping.
         """
         for _ in range(retries + 1):
             code, out = self.run_cli(["status"])
             if code == -1 and not out:
-                continue          # the CLI did not answer; that says nothing about the tunnel
-            return self.is_connected_output(out)
-        return False
+                continue
+            return out
+        return ""
+
+    def engine_is_dead(self, status_out):
+        """Either the Error-6 text or a CLI that stopped answering: both end at the same restart."""
+        return self.engine_is_stuck(status_out) or self.engine_is_hung()
+
+    def status_reads_connected(self, retries=1):
+        """True when a *readable* status says connected. An unreadable read is retried, not judged.
+
+        Returns False only on a status the CLI actually produced and that does not say connected, so
+        a timeout cannot be mistaken for a dropped tunnel. read_status() holds the retry loop; an
+        empty result means the CLI never answered, which is not a "connected" verdict either.
+        """
+        return self.is_connected_output(self.read_status(retries))
 
     @staticmethod
     def is_disconnected_output(out):
@@ -969,6 +982,15 @@ class WindscribeWorker:
                         if recovered:
                             self.log("Windscribe stopped answering; restarted it.", "WARN")
                     if not recovered:
+                        if self.stop_event.is_set():
+                            break
+                        if self.engine_is_hung():
+                            # The client is gone and cannot be brought back: every remaining route
+                            # would wait out a timeout and record nothing. Stop, like the Error-6 path.
+                            self.log(f"Windscribe stopped answering and could not be restarted "
+                                     f"({stuck_recoveries}/{MAX_STUCK_RECOVERIES} restarts used). "
+                                     f"Close Windscribe, open it again, then restart the run.", "FAILURE")
+                            break
                         self.log("Could not disconnect, skipping this test.", "FAILURE")
                         continue
                 self.phase(self.DISCONNECT, "done", time.time() - t0)
@@ -999,7 +1021,7 @@ class WindscribeWorker:
                 # the route and move on: Error 6 strikes individual Stealth/WStunnel attempts, so
                 # aborting the whole queue for one bad route is what threw away the rest of a run.
                 _, after = self.run_cli(["status"])
-                if self.engine_is_stuck(after):
+                if self.engine_is_dead(after):
                     self.phase(self.CONNECT, "fail")
                     restarted = False
                     if stuck_recoveries < MAX_STUCK_RECOVERIES:
@@ -1013,7 +1035,7 @@ class WindscribeWorker:
                         self.stop_event.wait(1)
                         connected, duration = self.wait_for_connection(start_ts, opts["timeout"])
                         _, after = self.run_cli(["status"])
-                        if self.engine_is_stuck(after):
+                        if self.engine_is_dead(after):
                             # The restart worked, so the client is fine; this ROUTE is what keeps
                             # killing it. Record the route and carry on with the queue.
                             self.log("Windscribe broke again; recording this route and moving on.",
