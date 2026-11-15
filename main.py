@@ -520,6 +520,8 @@ class DatabaseManager:
             return len(rows), csv_file
         except PermissionError:
             return -1, "File Open Error - Close the file if open."
+        except OSError as e:  # disk full, path too long, ...
+            return -1, f"Could not write the report: {e}"
 
     def clear_db(self):
         with self.lock:

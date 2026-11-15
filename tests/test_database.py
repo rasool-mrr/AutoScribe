@@ -65,6 +65,18 @@ def test_export_to_csv(db):
     assert len(rows) == 3
 
 
+def test_export_reports_any_write_error_instead_of_raising(db, monkeypatch):
+    add(db)
+
+    def disk_full(*args, **kwargs):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(main.csv, "writer", disk_full)
+    count, message = db.export_to_csv()
+    assert count == -1
+    assert "No space left on device" in message
+
+
 def test_export_numbers_increase(db):
     add(db)
     _, first = db.export_to_csv()
