@@ -18,6 +18,11 @@ import subprocess
 import sys
 import time
 
+import os
+
+# Run from contrib/ during development: main.py lives one level up.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import main
 
 # Most likely to survive filtering first, so a usable answer appears in the first few tries instead
@@ -144,8 +149,9 @@ def main_probe():
         if not worker.ensure_disconnected():
             print("could not disconnect; stopping", flush=True)
             break
+        start_ts = time.time()          # BEFORE connect: the wait must cover the connect call too
         worker.run_cli(["connect", "-n", args.server, route], timeout=args.timeout + 15)
-        connected, _ = worker.wait_for_connection(time.time(), args.timeout)
+        connected, _ = worker.wait_for_connection(start_ts, args.timeout)
         if not connected:
             print(f"no connection          ({time.time() - t0:4.1f}s)", flush=True)
             worker.run_cli(["disconnect"])

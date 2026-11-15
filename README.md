@@ -80,6 +80,21 @@ python main.py
 | Connect timeout | How long to wait for a connection, in seconds (3–300) |
 | Settle delay | Pause after connecting, before pinging (0–60 s) |
 
+### Automatic recovery
+
+Windscribe's client can stop responding after an aborted connection — its status line then reads
+`Connection:  Error: A required VPN process is not responding`, and no `connect`, `disconnect` or
+`firewall` call changes that. When AutoScribe sees this state, **it closes and restarts your
+Windscribe window** (the background service is left alone, and you stay signed in), then retries the
+route it was on. It does this at most three times per run; past that it stops and tells you to restart
+the client yourself.
+
+This means a run can make your Windscribe window disappear and come back. If you would rather drive
+that yourself, stop the run when the message appears instead of letting it continue.
+
+Every attempt is also written to `autoscribe.log` next to `main.py`. It is appended to on each launch
+(and rotated once past 2 MB) so a finished run stays readable afterwards.
+
 ## Files
 
 | File | Purpose |

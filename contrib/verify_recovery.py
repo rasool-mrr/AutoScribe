@@ -4,7 +4,13 @@ recover it, then confirm the CLI answers normally and stays logged in.
 This is the only check that proves the feature, because the stuck state comes from Windscribe's own
 engine, not from anything a fake can reproduce faithfully.
 """
+import argparse
 import sys
+
+import os
+
+# Run from contrib/ during development: main.py lives one level up.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import main
 
@@ -44,6 +50,16 @@ class Probe(main.WindscribeWorker):
 
 
 def main_probe():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--yes-kill-gui", action="store_true",
+                    help="required: this closes and restarts your running Windscribe window")
+    args = ap.parse_args()
+
+    if not args.yes_kill_gui:
+        print("This probe closes and restarts Windscribe's GUI window to test recovery.")
+        print("Re-run with --yes-kill-gui when nothing else is using it.")
+        return 2
+
     w = Probe()
 
     print("1. CLI reachable?")
