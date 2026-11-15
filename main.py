@@ -530,9 +530,15 @@ class DatabaseManager:
                 return 0
 
     def is_tested(self, location, city, country, proto, port):
+        """True when this route already has a real verdict.
+
+        CLI_STUCK is excluded on purpose: it says the Windscribe client was broken at that moment,
+        not that the route does not work. Counting it would make Resume skip that route forever.
+        """
         with self.lock:
             self.cursor.execute(
-                "SELECT 1 FROM tests WHERE location=? AND city=? AND country=? AND protocol=? AND port=?",
+                "SELECT 1 FROM tests WHERE location=? AND city=? AND country=? AND protocol=? AND port=?"
+                " AND status <> 'CLI_STUCK'",
                 (location, city, country, proto, port))
             return self.cursor.fetchone() is not None
 
@@ -991,6 +997,11 @@ class WindscribeWorker:
                             fail += 1
                             continue
                     else:
+                        if self.stop_event.is_set():
+                            # The user pressed Stop while recovery was waiting. That is not a verdict
+                            # about the route, so record nothing and leave cleanly.
+                            self.log("Stopped during recovery; this test was not recorded.", "WARN")
+                            break
                         self.log(f"Windscribe's VPN engine stopped responding and could not be "
                                  f"restarted ({stuck_recoveries}/{MAX_STUCK_RECOVERIES} restarts "
                                  f"used). Close Windscribe, open it again, then restart the run.",
