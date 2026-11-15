@@ -658,6 +658,10 @@ class WindscribeWorker:
         routes the ping silently goes out over the physical link and succeeds. So the status has to
         read connected both before and after the ping.
 
+        A status read that cannot be read at all is not evidence of a drop: run_cli returns (-1, "")
+        when the CLI itself times out, which happens under load. Only a readable, non-connected
+        status counts as "the tunnel died", so a CLI hiccup cannot throw away a good ping.
+
         `expected` is the 'City - Nickname' the caller asked for. When Windscribe lands on a different
         server the test does not describe the route the user picked, so it is not a success either.
         """
@@ -669,11 +673,24 @@ class WindscribeWorker:
             if is_different_server(actual, expected):
                 return False, None, f"connected to {actual} instead of {expected}"
         result, err = self.pinger.run(ping_host, ping_count)
-        if not self.is_connected_output(self.run_cli(["status"])[1]):
+        if not self.status_reads_connected():
             return False, result, "the connection dropped during the ping"
         if result:
             return True, result, None
         return False, None, err
+
+    def status_reads_connected(self, retries=1):
+        """True when a *readable* status says connected. An unreadable read is retried, not judged.
+
+        Returns False only on a status the CLI actually produced and that does not say connected, so
+        a timeout cannot be mistaken for a dropped tunnel.
+        """
+        for _ in range(retries + 1):
+            code, out = self.run_cli(["status"])
+            if code == -1 and not out:
+                continue          # the CLI did not answer; that says nothing about the tunnel
+            return self.is_connected_output(out)
+        return False
 
     @staticmethod
     def is_disconnected_output(out):

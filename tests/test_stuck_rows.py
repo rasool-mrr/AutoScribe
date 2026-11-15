@@ -41,10 +41,69 @@ def test_cli_stuck_has_a_translated_label():
         assert main.i18n.STRINGS["status_CLI_STUCK"][lang]
 
 
-def test_the_stuck_engine_is_still_detected_and_never_connected():
+def test_the_stuck_engine_is_detected_and_never_connected():
     assert main.WindscribeWorker.engine_is_stuck(STUCK) is True
     assert main.WindscribeWorker.is_connected_output(STUCK) is False
     assert main.WindscribeWorker.engine_is_stuck(DISC) is False
+
+
+# --- tunnel_carries_traffic: a timed-out status read must not fake a failure ---
+
+class _Seq:
+    def __init__(self, items):
+        self.items = list(items)
+
+    def pop(self, i=0):
+        return self.items.pop(i)
+
+
+class TrafficWorker(main.WindscribeWorker):
+    """Drives tunnel_carries_traffic with a scripted status sequence."""
+
+    def __init__(self, statuses, ping_result=None):
+        self.stop_event = FakeStop()
+        self.cli_cmd = "fake"
+        self._statuses = _Seq(statuses)
+        self.pings = _Seq([ping_result]) if ping_result is not None else _Seq([])
+        self.status_calls = 0
+
+    def run_cli(self, args, timeout=30):
+        self.status_calls += 1
+        return self._statuses.pop()
+
+    class _Pinger:
+        def __init__(self, outer):
+            self.outer = outer
+
+        def run(self, host, count=5, reply_timeout_ms=2000):
+            return self.outer.pings.pop()
+
+    @property
+    def pinger(self):
+        return self._Pinger(self)
+
+
+OK_PING = ({"avg": 40.0, "min": 38.0, "max": 42.0, "loss": 0.0}, None)
+CONNECTED = ("Login:       Logged in\n"
+             "Connection:  Connected to Melbourne - Yarra\n")
+CLI_TIMEOUT = (-1, "")
+DROPPED = "Login:       Logged in\nConnection:  Disconnected\n"
+
+
+def test_a_timed_out_status_read_after_the_ping_is_not_a_drop():
+    # run_cli returns (-1, "") when the CLI itself times out. That is "unknown", not "the tunnel
+    # died": treating it as a drop threw away a good ping and recorded a working route as FAILURE.
+    w = TrafficWorker([(0, CONNECTED), CLI_TIMEOUT, (0, CONNECTED)], OK_PING)
+    carried, result, err = w.tunnel_carries_traffic("1.1.1.1", 2)
+    assert carried is True, err
+    assert result["avg"] == 40.0
+
+
+def test_a_readable_disconnected_status_after_the_ping_is_still_a_drop():
+    w = TrafficWorker([(0, CONNECTED), (0, DROPPED)], OK_PING)
+    carried, _result, err = w.tunnel_carries_traffic("1.1.1.1", 2)
+    assert carried is False
+    assert "dropped" in err
 
 
 # --- behaviour of the retry-and-continue path, driven through the real loop ---
